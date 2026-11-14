@@ -24,16 +24,25 @@ STRATA_ORIGIN = f"https://github.com/{STRATA_REPO}.git"
 STRATA_BRANCH = "main"
 # Strata's unattended defaults can install missing system tools. The managed
 # setup uses the host's existing toolchain so wiping Strata stays self-contained.
-STRATA_SETUP_RUNNER = """
+STRATA_SETUP_RUNNER = r"""
 import os
+import re
 import runpy
 import sys
 
 def require_existing_toolchain(event, args):
-    if event == "subprocess.Popen":
-        program = os.path.splitext(os.path.basename(os.fsdecode(args[0])))[0].lower()
-        if program in {"winget", "sudo", "apt", "apt-get", "dpkg", "dnf", "pacman", "brew"}:
-            raise RuntimeError("Install Strata's native build prerequisites separately, then retry setup.")
+    if event != "subprocess.Popen":
+        return
+    executable, command, *_ = args
+    if executable is None:
+        # On Windows CreateProcess can receive only the serialized command line.
+        match = re.match(r'\s*(?:"([^"]+)"|(\S+))', command)
+        if match is None:
+            return
+        executable = match[1] or match[2]
+    program = os.path.splitext(os.path.basename(os.fsdecode(executable)))[0].lower()
+    if program in {"winget", "sudo", "apt", "apt-get", "dpkg", "dnf", "pacman", "brew"}:
+        raise RuntimeError("Install Strata's native build prerequisites separately, then retry setup.")
 
 sys.addaudithook(require_existing_toolchain)
 sys.argv = sys.argv[1:]
