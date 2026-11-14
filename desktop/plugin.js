@@ -6,14 +6,69 @@ const title = 'Strata Backend'
 const path = '/strata-backend'
 const hour = 60 * 60 * 1000
 
+function ModelSuggestions({ catalog }) {
+  const { recommendation, families } = catalog.data ?? {}
+  if (catalog.isPending) return jsx('p', { children: 'Reading Strata’s model catalog…' })
+  if (catalog.isError || catalog.data?.error) {
+    return jsx('p', { role: 'alert', children: catalog.data?.error ?? 'Could not load model suggestions.' })
+  }
+
+  const context = recommendation?.context ? `${Math.round(recommendation.context / 1024)}K context` : null
+  const download = recommendation?.download_gb == null ? null : `${recommendation.download_gb} GB download`
+  return jsxs('section', {
+    className: 'flex flex-col gap-3 border-t border-(--ui-stroke-secondary) pt-4',
+    children: [
+      jsx('h2', { className: 'font-medium', children: 'Suggested models' }),
+      jsxs('div', {
+        className: 'flex flex-col gap-1 rounded-md border border-(--ui-stroke-secondary) p-3',
+        children: [
+          recommendation?.title && jsx('strong', { children: recommendation.title }),
+          (context || download) && jsx('p', { children: [context, download].filter(Boolean).join(' · ') }),
+          jsx('p', { className: 'text-(--ui-text-secondary)', children: recommendation?.why }),
+          ...(recommendation?.notes ?? []).map(note => jsx('p', { children: note }, note)),
+        ],
+      }),
+      families?.length > 0 && jsxs('details', {
+        children: [
+          jsx('summary', { className: 'cursor-pointer', children: 'Browse Strata catalog' }),
+          ...families.map(family => jsxs('div', {
+            className: 'mt-3',
+            children: [
+              jsx('h3', { className: 'font-medium', children: family.title }),
+              family.unavailable_reason && jsx('p', { children: family.unavailable_reason }),
+              jsx('ul', {
+                className: 'divide-y divide-(--ui-stroke-secondary)',
+                children: family.sizes.map(size => jsxs('li', {
+                  className: 'flex flex-wrap justify-between gap-x-4 py-1.5',
+                  children: [
+                    jsx('span', { children: `${size.model}${size.installed ? ' · Installed' : ''}${size.experimental ? ' · Experimental' : ''}` }),
+                    jsx('span', {
+                      className: 'text-(--ui-text-secondary)',
+                      children: [
+                        size.on_this_pc,
+                        size.fit_gb == null ? null : `${size.fit_gb} GB memory`,
+                        size.download_gb == null ? null : `${size.download_gb} GB download`,
+                      ].filter(Boolean).join(' · '),
+                    }),
+                  ],
+                }, size.model)),
+              }),
+            ],
+          }, family.family)),
+        ],
+      }),
+    ],
+  })
+}
+
 function StrataPage({ ctx }) {
   const connection = useValue(host.state.connectionId)
   const profile = useValue(host.state.profile)
   const connected = useValue(host.state.gateway) === 'open'
-  const statusKey = [ctx.source, 'strata-status', connection, profile]
+  const statusKey = [ctx.source, 'strata-runtime-status', connection, profile]
   const status = useQuery({
     queryKey: statusKey,
-    queryFn: () => ctx.rest('/strata/status'),
+    queryFn: () => ctx.rest('/runtime/status'),
     enabled: connected,
     refetchInterval: query => query.state.data?.operation ? 2000 : false,
     retry: false,
@@ -21,16 +76,36 @@ function StrataPage({ ctx }) {
   const data = status.data
   const latest = useQuery({
     queryKey: [ctx.source, 'strata-latest', connection, profile, data?.revision],
-    queryFn: () => ctx.rest('/strata/latest'),
+    queryFn: () => ctx.rest('/runtime/latest'),
     enabled: connected && Boolean(data) && !data.operation,
     staleTime: hour,
     refetchInterval: hour,
     retry: false,
   })
+  const models = useQuery({
+    queryKey: [ctx.source, 'strata-models', connection, profile, data?.revision],
+    queryFn: () => ctx.rest('/runtime/models', { timeoutMs: 50_000 }),
+    enabled: connected && Boolean(data?.ready) && !data?.operation,
+    staleTime: hour,
+    retry: false,
+  })
   const requestLock = useRef(false)
   const [requesting, setRequesting] = useState(false)
   const [confirmWipe, setConfirmWipe] = useState(false)
+  const [restarting, setRestarting] = useState(false)
   const pending = requesting || Boolean(data?.operation)
+  const needsRestart = status.isError && /\b404\b/.test(String(status.error))
+
+  async function restartGateway() {
+    setRestarting(true)
+    try {
+      if (await host.restartGateway()) await status.refetch()
+    } catch (error) {
+      host.notifyError(error, 'Could not restart the Hermes gateway')
+    } finally {
+      setRestarting(false)
+    }
+  }
 
   async function run(operation) {
     if (requestLock.current || data?.operation) return
@@ -39,7 +114,7 @@ function StrataPage({ ctx }) {
     setConfirmWipe(false)
     try {
       haptic('tap')
-      const result = await ctx.rest(`/strata/action/${operation}`, { method: 'POST' })
+      const result = await ctx.rest(`/runtime/${operation}`, { method: 'POST' })
       if (!result.ok) throw new Error(result.error || 'The operation failed.')
       queryClient.setQueryData(statusKey, previous => ({ ...previous, operation }))
       await queryClient.invalidateQueries({ queryKey: statusKey, exact: true })
@@ -71,7 +146,7 @@ function StrataPage({ ctx }) {
       jsx('p', {
         className: 'text-(--ui-text-secondary)',
         'aria-live': 'polite',
-        children: busyLabel ?? (connected ? data ? stateLabel : 'Checking Strata…' : 'Waiting for the Hermes backend…'),
+        children: busyLabel ?? (connected ? data ? stateLabel : status.isError ? 'Backend unavailable' : 'Checking Strata…' : 'Waiting for the Hermes backend…'),
       }),
       data && !status.isError && jsxs('dl', {
         className: 'grid grid-cols-2 gap-2',
@@ -117,9 +192,21 @@ function StrataPage({ ctx }) {
           ] }),
         ],
       }),
-      (data?.error || status.isError) && jsx('p', {
-        role: 'alert', children: data?.error ?? 'The Strata backend is unavailable.',
+      (data?.error || status.isError) && jsxs('div', {
+        className: 'flex flex-col items-start gap-2',
+        children: [
+          jsx('p', {
+            role: 'alert',
+            children: data?.error ?? (needsRestart ? 'Restart the gateway once to activate the new Strata backend.' : 'The Strata backend is unavailable.'),
+          }),
+          status.isError && jsx('button', {
+            type: 'button', className: buttonClass, disabled: !connected || restarting || status.isFetching,
+            onClick: needsRestart ? () => void restartGateway() : () => void status.refetch(),
+            children: restarting ? 'Restarting gateway…' : needsRestart ? 'Restart gateway' : 'Retry',
+          }),
+        ],
       }),
+      data?.ready && !pending && jsx(ModelSuggestions, { catalog: models }),
       data?.log && jsxs('details', {
         children: [
           jsx('summary', { className: 'cursor-pointer', children: 'Setup log' }),
