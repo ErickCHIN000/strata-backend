@@ -1,8 +1,9 @@
-import { PANES_AREA, STATUSBAR_AREAS, host, haptic, useQuery, queryClient, useValue } from '@hermes/plugin-sdk'
+import { ROUTES_AREA, SIDEBAR_NAV_AREA, STATUSBAR_AREAS, host, haptic, useQuery, queryClient, useValue } from '@hermes/plugin-sdk'
 import { useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const title = 'Strata Backend'
+const path = '/strata-backend'
 const hour = 60 * 60 * 1000
 
 function VersionPill({ ctx }) {
@@ -74,11 +75,16 @@ export default {
   name: title,
   register(ctx) {
     ctx.register({
-      id: 'tab',
-      area: PANES_AREA,
+      id: 'page',
+      area: ROUTES_AREA,
       title,
-      data: { placement: 'main' },
+      data: { path },
       render: () => jsx('h1', { className: 'p-3 text-sm font-medium', children: title }),
+    })
+    ctx.register({
+      id: 'nav',
+      area: SIDEBAR_NAV_AREA,
+      data: { path, label: title, codicon: 'server' },
     })
     ctx.register({
       id: 'version',
