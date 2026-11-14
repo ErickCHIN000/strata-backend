@@ -27,7 +27,6 @@ STRATA_BRANCH = "main"
 STRATA_SETUP_RUNNER = r"""
 import os
 import re
-import runpy
 import sys
 
 def require_existing_toolchain(event, args):
@@ -45,8 +44,35 @@ def require_existing_toolchain(event, args):
         raise RuntimeError("Install Strata's native build prerequisites separately, then retry setup.")
 
 sys.addaudithook(require_existing_toolchain)
-sys.argv = sys.argv[1:]
-runpy.run_path(sys.argv[0], run_name="__main__")
+
+# Use Strata's build helpers directly. setup.main() selects and downloads a model.
+import setup as strata
+
+cuda_cards = sorted((gpu for gpu in strata.gpus() if not strata.gpu_problem(gpu)), key=strata.gpu_rank)
+hip_cards = [] if cuda_cards else [gpu for gpu in strata.amd_gpus() if not strata.amd_problem(gpu)]
+if not cuda_cards and not hip_cards:
+    sys.exit("No GPU supported by this Strata source setup was found.")
+if hip_cards and os.name == "nt":
+    sys.exit("Windows AMD source builds need Strata's separate HIP build workflow.")
+
+print("Installing Strata's Python runtime packages.", flush=True)
+strata.pip_install(strata.runtime_packages(), "Strata Python runtime packages")
+llama = strata.get_llama_cpp()
+if cuda_cards:
+    gpu = cuda_cards[0]
+    driver = str(gpu.get("driver", "")).partition(".")[0]
+    toolkit, _ = strata.cuda_choice([gpu["arch"]], driver=int(driver) if driver.isdecimal() else None)
+    print(f"Preparing the Strata engine for {gpu['name']}.", flush=True)
+    engine = strata.build_engine(gpu, "none", True, llama, toolkit=toolkit)
+else:
+    gpu = hip_cards[0]
+    print(f"Preparing the Strata engine for {gpu['name']}.", flush=True)
+    engine = strata.build_engine_hip(gpu, llama, "none")
+
+executable = engine / strata.EXE
+if not executable.is_file():
+    sys.exit("Strata's build did not produce an engine executable.")
+print(f"Engine ready: {executable}", flush=True)
 """
 GITHUB_ORIGIN = re.compile(
     r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
@@ -314,8 +340,7 @@ def prepare_strata(root: Path, operation: str, log) -> None:
     env["VIRTUAL_ENV"] = str(root / ".venv")
     env["PATH"] = str(python.parent) + os.pathsep + env.get("PATH", "")
     subprocess.run(
-        [str(python), "-c", STRATA_SETUP_RUNNER, "setup.py",
-         "--yes", "--build", "--no-start", "--data-dir", str(root / "data")],
+        [str(python), "-c", STRATA_SETUP_RUNNER],
         **options,
     )
     prepared.write_text(git_at(source, "rev-parse", "HEAD"), encoding="ascii")

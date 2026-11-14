@@ -13,7 +13,7 @@ In Hermes Desktop, open **Capabilities → Plugins**, rescan, and enable the Des
 
 ## Set up Strata
 
-Open **Strata Backend** in the sidebar and choose **Download and set up**. The plugin tracks [`Niko1221/Strata` on `main`](https://github.com/Niko1221/Strata/tree/main), builds the checked-out source, and runs Strata's setup in a private Python `.venv`. Setup uses Strata's recommended model and can download 70–120 GB of model data. It needs the toolchain for the selected GPU. The page shows the setup log while it runs.
+Open **Strata Backend** in the sidebar and choose **Download and set up**. The plugin tracks [`Niko1221/Strata` on `main`](https://github.com/Niko1221/Strata/tree/main), builds the checked-out engine source, and installs the Python dependencies in a private `.venv`. Model selection is separate. Engine setup needs the toolchain for the selected GPU. The page shows the setup log while it runs.
 
 Use **Update Strata** to fast-forward the managed checkout and run setup again. **Fresh wipe** removes only the managed Strata directory in this Hermes profile, including its venv, downloaded models, build products, and setup files. Reopen Hermes if the page reports that its backend is unavailable after updating the plugin itself.
 

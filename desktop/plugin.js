@@ -60,7 +60,7 @@ function StrataPage({ ctx }) {
   const updateAvailable = Boolean(latest.data?.update_available)
   const primaryAction = updateAvailable ? 'update' : 'setup'
   const primaryLabel = updateAvailable ? 'Update Strata' : data?.revision ? 'Set up Strata' : 'Download and set up'
-  const stateLabel = data?.ready ? 'Ready' : data?.revision ? 'Setup incomplete' : 'Not downloaded'
+  const stateLabel = data?.ready ? 'Engine ready' : data?.revision ? 'Setup incomplete' : 'Not downloaded'
   const latestRevision = latest.data?.latest
   const buttonClass = 'rounded-md border border-(--ui-stroke-secondary) px-3 py-1.5 text-sm hover:text-(--ui-accent) disabled:opacity-50'
 
@@ -84,7 +84,7 @@ function StrataPage({ ctx }) {
       }),
       data && !data.ready && !pending && jsx('p', {
         className: 'text-(--ui-text-secondary)',
-        children: 'Setup builds Strata in a private Python virtual environment and downloads its recommended model. Model files may take 70–120 GB.',
+        children: 'Setup builds the Strata engine and installs its Python dependencies in a private virtual environment. Model selection is separate.',
       }),
       jsxs('div', {
         className: 'flex flex-wrap items-center gap-2',
