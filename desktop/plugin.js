@@ -568,7 +568,7 @@ function StrataPage({ ctx }) {
         ],
       }),
       data?.ready && jsx(ModelSuggestions, { catalog: models, ...modelButtons }),
-      data?.ready && jsx(HuggingFaceModels, { ctx, ...modelButtons }, scopeKey),
+      data?.ready && jsx(HuggingFaceModels, { ctx, ...modelButtons }, `hf:${scopeKey}`),
       modelDownloads.length > 0 && jsxs('section', {
         className: sectionClass,
         children: [
@@ -591,7 +591,7 @@ function StrataPage({ ctx }) {
       library.data?.profiles && jsx(ModelProfiles, {
         ctx, queryScope, library: library.data, catalog: models.data, revision: data?.ready ? data.revision : null,
         onSave: () => queryClient.invalidateQueries({ queryKey: libraryKey, exact: true }),
-      }, scopeKey),
+      }, `profiles:${scopeKey}`),
     ],
   })
 }
