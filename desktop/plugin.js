@@ -797,12 +797,15 @@ function followDesktopModel(ctx) {
   let closed = false
   let lastModel = ''
   let reportedError = ''
+  let observedScope = ''
+  let observedModel = null
+  let load = false
   const sessionModels = new Map()
 
   function send(model, focus, exiting = false) {
     sequence = Math.max(sequence + 1, Date.now() * 1000)
     return ctx.rest('/runtime/desktop-selection', {
-      method: 'POST', body: { client, sequence, model, focus, closed: exiting }, timeoutMs: 16_000,
+      method: 'POST', body: { client, sequence, model, focus, load, closed: exiting }, timeoutMs: 16_000,
     })
   }
 
@@ -811,24 +814,40 @@ function followDesktopModel(ctx) {
     if (sending) { queued = true; return }
     sending = true
     try {
-      const sid = host.state.focusedSessionId.get()
+      const active = host.state.activeSessionId.get()
+      const sid = host.state.focusedSessionId.get() ?? active
       const connection = host.state.connectionId.get()
       const profile = host.state.profile.get()
+      const scope = JSON.stringify([connection, profile, sid])
+      if (scope !== observedScope) {
+        observedScope = scope
+        observedModel = null
+        load = false
+      }
       let model = host.state.model.get()
-      if (sid && sid !== host.state.activeSessionId.get()) {
+      if (sid) {
         const owner = host.state.focusedSessionOwner.get()
-        if (owner && (owner.connectionId !== (connection ?? 'local') || owner.profile !== profile)) return
-        model = sessionModels.get(sid)
-        if (model == null) {
+        if (sid !== active && owner && (owner.connectionId !== (connection ?? 'local') || owner.profile !== profile)) return
+        // The primary composer paints model picks optimistically. A live chat's
+        // session.info is authoritative, including switches that are deferred or rolled back.
+        const observed = sessionModels.get(scope)
+        if (!observed || (sid === active && observed.model !== model)) {
           const info = await host.request('session.info', { session_id: sid })
-          if (closed || sid !== host.state.focusedSessionId.get() || connection !== host.state.connectionId.get() || profile !== host.state.profile.get()) return
-          model = typeof info?.model === 'string' ? info.model : ''
-          sessionModels.set(sid, model)
+          const focused = host.state.focusedSessionId.get() ?? host.state.activeSessionId.get()
+          if (closed || sid !== focused || connection !== host.state.connectionId.get() || profile !== host.state.profile.get()) return
+          if (sessionModels.get(scope) === observed && typeof info?.model === 'string') {
+            sessionModels.set(scope, { model: info.model })
+          }
         }
+        model = sessionModels.get(scope)?.model
+      }
+      if (model) {
+        if (observedModel !== null && model !== observedModel) load = true
+        observedModel = model
+        lastModel = model
       }
       const focus = claimFocus
       claimFocus = false
-      if (model) lastModel = model
       const result = await send(model || null, focus)
       if (result?.error && result.error !== reportedError && !result.error.includes('already running')) {
         reportedError = result.error
@@ -848,13 +867,17 @@ function followDesktopModel(ctx) {
   }
 
   const refreshSoon = () => void refresh()
-  for (const state of [host.state.model, host.state.gateway, host.state.profile, host.state.connectionId, host.state.focusedSessionId]) {
+  for (const state of [host.state.model, host.state.gateway, host.state.profile, host.state.connectionId,
+    host.state.activeSessionId, host.state.focusedSessionId]) {
     ctx.onDispose(state.listen(refreshSoon))
   }
   ctx.onEvent('session.info', event => {
     if (event.session_id && typeof event.payload?.model === 'string') {
-      sessionModels.set(event.session_id, event.payload.model)
-      if (event.session_id === host.state.focusedSessionId.get()) refreshSoon()
+      const connection = host.state.connectionId.get()
+      const profile = host.state.profile.get()
+      if (event.profile && event.profile !== profile) return
+      sessionModels.set(JSON.stringify([connection, profile, event.session_id]), { model: event.payload.model })
+      if (event.session_id === (host.state.focusedSessionId.get() ?? host.state.activeSessionId.get())) refreshSoon()
     }
   })
   ctx.addEventListener(window, 'focus', () => { claimFocus = true; refreshSoon() })

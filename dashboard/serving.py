@@ -19,7 +19,7 @@ import psutil
 PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
 ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe"}
-PROVIDER_PROTOCOL = 2
+PROVIDER_PROTOCOL = 3
 DESKTOP_LEASE_SECONDS = 65
 
 
@@ -88,12 +88,14 @@ def touch_desktop(root, payload):
         return
     now = time()
     order = now if payload.get("focus") or previous.get("model") != model or not previous.get("order") else previous["order"]
+    same_model = previous.get("model") == model
+    load = payload.get("load") is not False or (same_model and previous.get("load", True) and bool(previous))
     write_json(path, {"model": model, "seen": now, "order": order, "sequence": sequence, "closed": payload.get("closed") is True,
-                      "intent": secrets.token_hex(12) if previous.get("model") != model or not previous.get("intent")
-                      else previous["intent"]})
+                      "load": load,
+                      "intent": previous["intent"] if same_model and previous.get("intent") else secrets.token_hex(12)})
 
 
-def desktop_choice(root):
+def desktop_choice(root, *, include_dormant=False):
     directory = service_root(root)
     windows = [read_json(path) for path in (directory / "windows").glob("*.json")]
     cutoff = time() - DESKTOP_LEASE_SECONDS
@@ -104,7 +106,9 @@ def desktop_choice(root):
     roster = read_json(directory / "models.json")
     selected = roster.get(choice["model"])
     held = read_json(directory / "hold.json")
-    if selected and held.get("intent") != choice.get("intent"):
+    demand = read_json(directory / "demand.json")
+    loading = choice.get("load", True) or demand.get("intent") == choice.get("intent")
+    if selected and (loading or include_dormant) and held.get("intent") != choice.get("intent"):
         return {**selected, "alias": choice["model"], "intent": choice["intent"]}, False
     return None, False
 
@@ -427,7 +431,7 @@ def stop_instance(root, payload):
     if process is None:
         raise ValueError("That Strata process has already exited or changed identity.")
     if row.get("profile_id"):
-        selection, _ = desktop_choice(root)
+        selection, _ = desktop_choice(root, include_dormant=True)
         if selection and selection["profile_id"] == row["profile_id"]:
             hold_desktop_choice(root, selection["intent"])
     stop_process_tree(process, managed=row["managed"])
@@ -510,6 +514,12 @@ def serve_bridge(directory):
             instance = read_json(instance_file(directory, selected["profile_id"]))
             choice, _ = desktop_choice(root)
             tracked = (directory / "windows").is_dir()
+            if choice is None and tracked:
+                dormant, _ = desktop_choice(root, include_dormant=True)
+                if dormant and dormant["alias"] == alias:
+                    # A request to the restored profile is explicit use. Idle startup stays cold.
+                    write_json(directory / "demand.json", {"intent": dormant["intent"]})
+                    choice, _ = desktop_choice(root)
             matching = bool(choice and choice["alias"] == alias)
             if (process_for(instance) and instance.get("model") == alias and instance.get("port")
                     and (matching or not tracked) and await asyncio.to_thread(online, instance, "/health")):
