@@ -21,6 +21,8 @@ Once the engine is ready, **Suggested models** shows Strata's hardware-based rec
 
 Under **Hugging Face models**, enter an `owner/repo` and optionally an exact GGUF filename or quantization. For example, enter `unsloth/Qwen3.8-27B-GGUF` and `Qwen3.8-27B-UD-Q4_K_M.gguf`. The picker groups complete shard sets. The Hub client runs in the managed venv and uses the existing Hugging Face login and cache. External GGUF downloads are listed with compatibility unverified.
 
+The DavidAU Flash-Next shortcut points to two raw `IQ3_S` shards and a separate vision projector. The downloaded model needs a Strata pack prepared separately before a compatibility test.
+
 **Model profiles** save common memory and context settings, raw Strata engine, launch, setup and server arguments, environment variables, and run config overrides. The option reference comes from the installed build. Profiles can be associated with a model or saved as reusable presets. Fresh wipe preserves profiles and the shared Hugging Face cache.
 
 On upgrading from v0.2.2 or earlier, use the **Restart gateway** button in the Strata tab to activate the new Python router once. Updates to the plugin's runtime handlers are then picked up on the next request through that router.

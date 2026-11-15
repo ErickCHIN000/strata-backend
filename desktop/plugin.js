@@ -1,4 +1,7 @@
-import { ROUTES_AREA, SIDEBAR_NAV_AREA, STATUSBAR_AREAS, host, haptic, useQuery, queryClient, useValue } from '@hermes/plugin-sdk'
+import {
+  ROUTES_AREA, SIDEBAR_NAV_AREA, STATUSBAR_AREAS, host, haptic, useQuery, queryClient, useValue,
+  Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
+} from '@hermes/plugin-sdk'
 import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -9,6 +12,31 @@ const buttonClass = 'rounded-md border border-(--ui-stroke-secondary) px-3 py-1.
 const inputClass = 'w-full rounded-md border border-(--ui-stroke-secondary) bg-transparent px-2 py-1.5 text-sm'
 const sectionClass = 'flex flex-col gap-3 border-t border-(--ui-stroke-secondary) pt-4'
 const preferredRepo = 'DavidAU/Qwen3.8-Flash-Next-Abliterated-Uncensored-Turbo-Brilliance-50x-Reasoning-Instruct-GSQ-RCO-GGUF'
+const emptySelection = ':empty:'
+
+function ThemedSelect({ label, value, options, onChange, disabled, placeholder }) {
+  const selected = value === '' && options.some(([id]) => id === '') ? emptySelection : value
+  return jsxs('div', {
+    children: [
+      jsx('div', { children: label }),
+      jsxs(Select, {
+        value: selected, disabled, onValueChange: id => onChange(id === emptySelection ? '' : id),
+        children: [
+          jsx(SelectTrigger, {
+            'aria-label': label, className: 'w-full min-w-0',
+            children: jsx(SelectValue, { className: 'truncate', placeholder }),
+          }),
+          jsx(SelectContent, {
+            className: 'max-w-[min(85vw,48rem)]',
+            children: options.map(([id, title]) => jsx(SelectItem, {
+              value: id || emptySelection, className: 'whitespace-normal break-words', children: title,
+            }, id || emptySelection)),
+          }),
+        ],
+      }),
+    ],
+  })
+}
 
 function catalogId(family, model) {
   return `catalog:${family}:${model}`
@@ -133,6 +161,7 @@ function HuggingFaceModels({ ctx, downloads, busy, onDownload }) {
 
   const selection = group && { source: 'hf', repo: catalog.repo, revision: catalog.revision, group: group.id }
   const downloaded = selection && downloads.has(`hf:${selection.repo}@${selection.revision}:${selection.group}`)
+  const needsPack = catalog?.repo.toLowerCase() === preferredRepo.toLowerCase()
   return jsxs('section', {
     className: sectionClass,
     children: [
@@ -175,14 +204,9 @@ function HuggingFaceModels({ ctx, downloads, busy, onDownload }) {
           ? 'Hugging Face CLI detected. Using anonymous access.' : 'Using anonymous Hugging Face access.',
       }),
       catalog?.groups.length === 0 && jsx('p', { children: 'This repository has no complete GGUF files or shard sets.' }),
-      catalog?.groups.length > 0 && jsxs('label', {
-        children: ['Files to download', jsxs('select', {
-          className: inputClass, value: selected, onChange: event => setSelected(event.target.value),
-          children: [jsx('option', { value: '', children: 'Choose a file or shard group' }),
-            ...catalog.groups.map(row => jsx('option', {
-              value: row.id, children: [row.label, downloadSize(row.bytes), row.cached ? 'Cached' : null].filter(Boolean).join(' · '),
-            }, row.id))],
-        })],
+      catalog?.groups.length > 0 && jsx(ThemedSelect, {
+        label: 'Files to download', value: selected, onChange: setSelected, placeholder: 'Choose a file or shard group',
+        options: catalog.groups.map(row => [row.id, [row.label, downloadSize(row.bytes), row.cached ? 'Cached' : null].filter(Boolean).join(' · ')]),
       }),
       group && jsxs('div', {
         className: 'flex flex-wrap items-center gap-2',
@@ -192,8 +216,12 @@ function HuggingFaceModels({ ctx, downloads, busy, onDownload }) {
             label: group.cached ? 'Use cached files' : 'Download',
           }),
           jsx('span', { children: `${group.files.length} ${group.files.length === 1 ? 'file' : 'files'}${group.bytes == null ? '' : ` · ${downloadSize(group.bytes)}`}` }),
-          jsx('span', { className: 'text-(--ui-text-secondary)', children: 'Strata compatibility unverified' }),
+          jsx('span', { className: 'text-(--ui-text-secondary)', children: 'Raw GGUF · Strata compatibility unverified' }),
         ],
+      }),
+      needsPack && jsx('p', {
+        className: 'text-(--ui-text-secondary)',
+        children: 'The DavidAU model ships as GGUF shards. Prepare a Strata pack from the shards separately before trying to run it.',
       }),
     ],
   })
@@ -243,9 +271,9 @@ function OptionReference({ ctx, queryScope, revision, enabled }) {
       selection && jsxs('div', {
         className: 'mt-2 flex flex-col gap-2',
         children: [
-          jsxs('select', {
-            'aria-label': 'Option category', className: inputClass, value: selection, onChange: event => setSection(event.target.value),
-            children: Object.keys(sections).map(name => jsx('option', { value: name, children: name }, name)),
+          jsx(ThemedSelect, {
+            label: 'Option category', value: selection, onChange: setSection,
+            options: Object.keys(sections).map(name => [name, name]),
           }),
           jsx('input', {
             'aria-label': 'Filter options', className: inputClass, value: filter, placeholder: 'Filter options',
@@ -302,13 +330,10 @@ function ModelProfiles({ ctx, queryScope, library, catalog, revision, onSave }) 
       jsxs('form', {
         className: 'flex flex-col gap-3', onSubmit: save,
         children: [
-          jsxs('label', {
-            children: ['Saved profiles', jsxs('select', {
-              className: inputClass, value: draft.id ?? '', disabled: saving,
-              onChange: event => { setDraft(profileDraft(profiles.find(profile => profile.id === event.target.value))); setFeedback(null) },
-              children: [jsx('option', { value: '', children: 'New profile' }),
-                ...profiles.map(profile => jsx('option', { value: profile.id, children: profile.name }, profile.id))],
-            })],
+          jsx(ThemedSelect, {
+            label: 'Saved profiles', value: draft.id ?? '', disabled: saving,
+            onChange: id => { setDraft(profileDraft(profiles.find(profile => profile.id === id))); setFeedback(null) },
+            options: [['', 'New profile'], ...profiles.map(profile => [profile.id, profile.name])],
           }),
           jsxs('label', {
             children: ['Name', jsx('input', {
@@ -316,12 +341,9 @@ function ModelProfiles({ ctx, queryScope, library, catalog, revision, onSave }) 
               onChange: event => edit('name', event.target.value),
             })],
           }),
-          jsxs('label', {
-            children: ['Model', jsxs('select', {
-              className: inputClass, value: draft.model_id, disabled: saving, onChange: event => edit('model_id', event.target.value),
-              children: [jsx('option', { value: '', children: 'Any model' }),
-                ...Array.from(entries, ([id, title]) => jsx('option', { value: id, children: title }, id))],
-            })],
+          jsx(ThemedSelect, {
+            label: 'Model', value: draft.model_id, disabled: saving, onChange: id => edit('model_id', id),
+            options: [['', 'Any model'], ...entries],
           }),
           jsx('div', {
             className: 'grid gap-2 sm:grid-cols-2',
@@ -537,7 +559,9 @@ function StrataPage({ ctx }) {
               className: 'break-words py-2',
               children: [jsx('div', { children: model.title }), jsx('div', {
                 className: 'text-(--ui-text-secondary)',
-                children: [model.repo, downloadSize(model.bytes), model.source === 'hf' ? 'Strata compatibility unverified' : null].filter(Boolean).join(' · '),
+                children: [model.repo, downloadSize(model.bytes), model.source === 'hf'
+                  ? model.repo?.toLowerCase() === preferredRepo.toLowerCase() ? 'Strata pack needed' : 'Raw GGUF, compatibility unverified'
+                  : null].filter(Boolean).join(' · '),
               })],
             }, model.id)),
           }),
