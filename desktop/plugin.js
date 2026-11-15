@@ -474,13 +474,15 @@ function StrataPage({ ctx }) {
   const downloads = new Set(modelDownloads.map(model => model.id))
   const scopeKey = JSON.stringify([connection, profile])
   const modelButtons = { downloads, busy: pending || !connected, onDownload: body => void run('download', body) }
-  const activeRoute = host.profileRoutes?.().find(route => route.connectionId === (connection ?? 'local') && route.profile === profile)
-  const localBackend = activeRoute ? activeRoute.mode === 'local' : connection == null || connection === 'local'
   const modelsFolder = library.data?.models_folder
 
   async function openModelsFolder() {
-    if (!localBackend || !modelsFolder) return
+    if (!modelsFolder) return
     try {
+      const routes = await host.profileRoutes()
+      if (connection !== host.state.connectionId.get() || profile !== host.state.profile.get()) return
+      const route = routes.find(candidate => candidate.connectionId === (connection ?? 'local') && candidate.profile === profile)
+      if (route?.mode !== 'local') throw new Error('Opening the models folder requires a local Hermes backend.')
       const result = await window.hermesDesktop?.openDir?.(modelsFolder)
       if (!result?.ok) throw new Error(result?.error || 'Opening folders requires Hermes Desktop.')
     } catch (error) {
@@ -523,8 +525,7 @@ function StrataPage({ ctx }) {
             onClick: () => void latest.refetch(), children: 'Check for updates',
           }),
           jsx('button', {
-            type: 'button', className: buttonClass, disabled: !connected || !modelsFolder || !localBackend || data?.operation === 'wipe',
-            title: localBackend ? undefined : 'The models folder is on the connected backend.',
+            type: 'button', className: buttonClass, disabled: !connected || !modelsFolder || data?.operation === 'wipe',
             onClick: () => void openModelsFolder(), children: 'Open models folder',
           }),
           data?.has_data && !confirmWipe && jsx('button', {
