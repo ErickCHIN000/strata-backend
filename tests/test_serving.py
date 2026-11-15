@@ -14,6 +14,39 @@ from dashboard import serving
 
 
 class ServingTests(unittest.TestCase):
+    def test_clearing_exited_instances_preserves_the_running_row_and_launch_record(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            directory = serving.service_root(root)
+            exited_path = serving.instance_file(directory, "a" * 32)
+            active_path = serving.instance_file(directory, "b" * 32)
+            exited = {"profile_id": "a" * 32, "pid": 100, "started": 1, "intent": "failed-launch"}
+            active = {"profile_id": "b" * 32, "pid": 101, "started": 2}
+            serving.write_json(exited_path, exited)
+            serving.write_json(active_path, active)
+            log = exited_path.with_suffix(".log")
+            log.write_text("Reason the startup failed", encoding="utf-8")
+
+            def process_for(record):
+                if record.get("pid") == 101:
+                    return SimpleNamespace(pid=101, children=lambda **_: [])
+                return None
+
+            with (
+                patch.object(serving, "process_for", side_effect=process_for),
+                patch.object(serving, "online", return_value=True),
+                patch.object(serving, "external_strata", return_value=[]),
+            ):
+                self.assertCountEqual([row["state"] for row in serving.instance_rows(root)], ["exited", "ready"])
+                serving.clear_exited_instances(root)
+                serving.clear_exited_instances(root)
+                self.assertEqual([row["pid"] for row in serving.instance_rows(root)], [101])
+                self.assertEqual(serving.read_json(exited_path), {**exited, "dismissed": True})
+                serving.write_json(exited_path, {**exited, "pid": 102, "started": 3})
+                self.assertIn(102, [row["pid"] for row in serving.instance_rows(root)])
+            self.assertEqual(serving.read_json(active_path), active)
+            self.assertEqual(log.read_text(encoding="utf-8"), "Reason the startup failed")
+
     def test_performance_exposes_counters_without_request_content(self):
         metrics = {"engine": {"model": "iq3", "expert_cache_mib": 7966},
                    "live": {"tok_s_mean": 88.5}, "hardware": {"ram_used": 40 << 30, "gpu_mem_used": 18 << 30},

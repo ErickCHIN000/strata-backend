@@ -531,7 +531,13 @@ function ServingControls({ ctx, serving }) {
       jsx('p', { className: 'text-(--ui-text-secondary)', children: state?.provider_ready
         ? 'Select a saved Strata profile in the Hermes model picker to load it. Selecting another provider unloads Strata.'
         : state?.models?.length ? 'Registering the Strata provider with Hermes…' : 'Save a profile linked to a downloaded model to make it available in the picker.' }),
-      jsx('h3', { className: 'font-medium', children: 'Strata processes' }),
+      jsxs('div', { className: 'flex flex-wrap items-center justify-between gap-2', children: [
+        jsx('h3', { className: 'font-medium', children: 'Strata processes' }),
+        rows.some(row => row.state === 'exited') && jsx('button', {
+          type: 'button', className: buttonClass, disabled: requesting,
+          onClick: () => void request('clear-exited'), children: 'Clear exited',
+        }),
+      ] }),
       !rows.length && jsx('p', { className: 'text-(--ui-text-secondary)', children: 'No Strata processes detected.' }),
       rows.length > 0 && jsx('ul', {
         className: 'divide-y divide-(--ui-stroke-secondary)',

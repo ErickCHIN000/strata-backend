@@ -518,6 +518,17 @@ def preparation_progress(output):
     return {}
 
 
+def clear_exited_instances(root):
+    instances = service_root(root) / "instances"
+    if instances.resolve() != instances:
+        raise ValueError("The Strata process records moved outside the managed installation.")
+    for file in instances.glob("*.json"):
+        record = read_json(file)
+        if record.get("pid") and not record.get("dismissed") and not process_for(record):
+            # Keep the launch intent so hiding a failed launch cannot make the heartbeat retry it.
+            write_json(file, {**record, "dismissed": True})
+
+
 def instance_rows(root, *, include_stats=False):
     directory = service_root(root)
     rows = []
@@ -530,6 +541,8 @@ def instance_rows(root, *, include_stats=False):
     for file in (directory / "instances").glob("*.json"):
         config = read_json(file)
         process = process_for(config)
+        if not process and config.get("dismissed"):
+            continue
         state = ("ready" if online(config, "/health") else config.get("phase", "starting")) if process else "exited"
         if process:
             owned_pids.add(process.pid)

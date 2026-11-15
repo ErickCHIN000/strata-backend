@@ -671,6 +671,21 @@ def stop_serving_instance(payload):
         return {"ok": False, "error": "Could not stop the selected Strata instance."}
 
 
+def clear_exited_instances(_payload):
+    from hermes_cli.plugins_auto_update import plugin_update_lock
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    try:
+        root = strata_directory()
+        with plugin_update_lock(root):
+            serving_tools()["clear_exited_instances"](root)
+        return {"ok": True}
+    except (ValueError, PluginOperationError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except (OSError, ImportError):
+        return {"ok": False, "error": "Could not clear exited Strata processes."}
+
+
 def launch_saved_profile(root, payload, log):
     library = model_library()
     selected = next((p for p in library.get("profiles", []) if p["id"] == payload["id"]), None)
@@ -945,4 +960,5 @@ POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile,
                       "delete-profile": partial(delete_library_entry, "profile"),
                       "pause-download": pause_download, "resume-download": resume_download,
                       "setup-provider": setup_hermes_provider, "start-profile": start_serving_profile,
-                      "stop-instance": stop_serving_instance, "desktop-selection": desktop_selection})
+                      "stop-instance": stop_serving_instance, "clear-exited": clear_exited_instances,
+                      "desktop-selection": desktop_selection})
