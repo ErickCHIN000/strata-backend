@@ -232,7 +232,7 @@ const controls = [
   { flag: '--max-context', label: 'Context tokens', min: 1, step: 1 },
   { flag: '--memory-limit-mib', label: 'Serving RAM budget (MiB)', min: 0, step: 1 },
   { flag: '--resident-budget-gib', label: 'Resident expert RAM (GiB)', min: 0.001, step: 'any' },
-  { flag: '--vram-reserve-mib', label: 'VRAM to leave free (MiB)', min: 0, step: 1 },
+  { flag: '--vram-reserve-mib', label: 'VRAM reserve target (MiB)', min: 0, step: 1 },
 ]
 
 const advancedFields = {
@@ -416,11 +416,15 @@ function DownloadProgress({ transfer, active, busy, pausing, onPause, onResume }
   })
 }
 
-function ServingControls({ ctx, queryScope }) {
-  const serving = useQuery({
-    queryKey: [...queryScope, 'strata-serving'], queryFn: () => ctx.rest('/runtime/serving'),
-    refetchInterval: 3000, retry: false,
-  })
+function startupLabel(row) {
+  if (row?.stage === 'downloading-mtp') return ['Downloading MTP', row.detail].filter(Boolean).join(' · ')
+  if (row?.stage === 'packing-mtp') return 'Packing MTP'
+  if (row?.stage === 'loading-model' || row?.state === 'starting') return 'Loading model'
+  if (row?.state === 'preparing') return 'Preparing model files'
+  return row?.state
+}
+
+function ServingControls({ ctx, serving }) {
   const [requesting, setRequesting] = useState(false)
   const [confirmStop, setConfirmStop] = useState(null)
   const state = serving.data
@@ -456,7 +460,7 @@ function ServingControls({ ctx, queryScope }) {
           className: 'flex flex-wrap items-center justify-between gap-2 py-2',
           children: [
             jsxs('div', { className: 'min-w-0 break-words', children: [
-              jsx('div', { children: `${row.name} · ${row.state}` }),
+              jsx('div', { children: `${row.name} · ${startupLabel(row)}` }),
               jsx('div', { className: 'text-(--ui-text-secondary)', children: [row.managed ? 'Managed' : 'External', row.pid && `PID ${row.pid}`, row.path].filter(Boolean).join(' · ') }),
               row.log && jsxs('details', { children: [jsx('summary', { children: 'Server log' }),
                 jsx('pre', { className: 'max-h-48 overflow-auto whitespace-pre-wrap text-xs', children: row.log })] }),
@@ -493,6 +497,12 @@ function StrataPage({ ctx }) {
     retry: false,
   })
   const data = status.data
+  const serving = useQuery({
+    queryKey: [...queryScope, 'strata-serving'],
+    queryFn: () => ctx.rest('/runtime/serving'),
+    enabled: connected && Boolean(data),
+    refetchInterval: 3000, retry: false,
+  })
   const latest = useQuery({
     queryKey: [ctx.source, 'strata-latest', connection, profile, data?.revision],
     queryFn: () => ctx.rest('/runtime/latest'),
@@ -579,7 +589,8 @@ function StrataPage({ ctx }) {
     update: 'Updating and building Strata…',
     wipe: 'Removing managed Strata files…',
     download: 'Downloading model files…',
-    serve: 'Preparing the model and starting Strata…',
+    serve: startupLabel(serving.data?.instances?.find(row => !row.provider && row.state === 'preparing'))
+      ?? 'Preparing model files',
   }
   const busyLabel = operationLabels[data?.operation]
   const updateAvailable = Boolean(latest.data?.update_available)
@@ -713,7 +724,7 @@ function StrataPage({ ctx }) {
         ctx, queryScope, library: library.data, revision: data?.ready ? data.revision : null,
         onSave: () => queryClient.invalidateQueries({ queryKey: libraryKey, exact: true }),
       }, `profiles:${scopeKey}`),
-      connected && data && jsx(ServingControls, { ctx, queryScope }, `serving:${scopeKey}`),
+      connected && data && jsx(ServingControls, { ctx, serving }, `serving:${scopeKey}`),
     ],
   })
 }
@@ -801,6 +812,7 @@ function followDesktopModel(ctx) {
   let observedModel = null
   let load = false
   const sessionModels = new Map()
+  const sessionProbes = new Set()
 
   function send(model, focus, exiting = false) {
     sequence = Math.max(sequence + 1, Date.now() * 1000)
@@ -831,13 +843,17 @@ function followDesktopModel(ctx) {
         // The primary composer paints model picks optimistically. A live chat's
         // session.info is authoritative, including switches that are deferred or rolled back.
         const observed = sessionModels.get(scope)
-        if (!observed || (sid === active && observed.model !== model)) {
-          const info = await host.request('session.info', { session_id: sid })
-          const focused = host.state.focusedSessionId.get() ?? host.state.activeSessionId.get()
-          if (closed || sid !== focused || connection !== host.state.connectionId.get() || profile !== host.state.profile.get()) return
-          if (sessionModels.get(scope) === observed && typeof info?.model === 'string') {
-            sessionModels.set(scope, { model: info.model })
-          }
+        if ((!observed || (sid === active && observed.model !== model)) && !sessionProbes.has(scope)) {
+          // Confirm the session independently so a slow RPC cannot stop the desktop lease.
+          sessionProbes.add(scope)
+          void host.request('session.info', { session_id: sid }).then(info => {
+            const focused = host.state.focusedSessionId.get() ?? host.state.activeSessionId.get()
+            if (closed || sid !== focused || connection !== host.state.connectionId.get() || profile !== host.state.profile.get()) return
+            if (sessionModels.get(scope) === observed && typeof info?.model === 'string' && info.model !== observed?.model) {
+              sessionModels.set(scope, { model: info.model })
+              void refresh()
+            }
+          }).catch(() => undefined).finally(() => sessionProbes.delete(scope))
         }
         model = sessionModels.get(scope)?.model
       }

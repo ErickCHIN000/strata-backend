@@ -19,7 +19,7 @@ import psutil
 PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
 ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe"}
-PROVIDER_PROTOCOL = 3
+PROVIDER_PROTOCOL = 4
 DESKTOP_LEASE_SECONDS = 65
 
 
@@ -385,6 +385,30 @@ def external_strata():
             continue
 
 
+def log_tail(path, limit):
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - limit))
+            return handle.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def preparation_progress(output):
+    for line in reversed(output.splitlines()):
+        if line.lstrip().startswith("> "):
+            tool = re.search(r"\bmtp_(fetch|pack|rt)\.py\b", line)
+            if tool:
+                return {"stage": "downloading-mtp" if tool[1] == "fetch" else "packing-mtp"}
+            return {}
+        progress = re.fullmatch(r"\s*MTP draft layer:\s+([\d.,]+\s*/\s*[\d.,]+\s+GB\s*\(\d+%\))\s*", line)
+        if progress:
+            return {"stage": "downloading-mtp", "detail": progress[1]}
+        if line.lstrip().startswith(("===", "[ok] MTP draft layer:")):
+            return {}
+    return {}
+
+
 def instance_rows(root):
     directory = service_root(root)
     rows = []
@@ -407,13 +431,12 @@ def instance_rows(root):
         row = {"pid": config.get("pid"), "started": config.get("started"), "name": config.get("name"),
                "profile_id": config.get("profile_id"), "managed": True, "state": state, "port": config.get("port")}
         logfile = file.with_suffix(".log")
-        if state in ("starting", "exited") and logfile.is_file():
-            try:
-                with logfile.open("rb") as handle:
-                    handle.seek(max(0, logfile.stat().st_size - 1800))
-                    row["log"] = handle.read(1800).decode("utf-8", errors="replace")
-            except OSError:
-                pass
+        if state == "preparing":
+            row.update(preparation_progress(log_tail(root / "setup.log", 16384)))
+        elif state in ("starting", "exited"):
+            row["log"] = log_tail(logfile, 1800)
+            if state == "starting":
+                row["stage"] = "loading-model"
         rows.append(row)
     for process, info in external_strata():
         if process.pid not in owned_pids:
@@ -508,7 +531,9 @@ def serve_bridge(directory):
         if not selected:
             raise HTTPException(404, "Unknown Strata profile. Refresh the Hermes model picker.")
         deadline = monotonic() + 480
-        selection_grace = monotonic() + 4
+        # Session confirmation and the desktop heartbeat can arrive after the first prompt.
+        selection_grace = monotonic() + DESKTOP_LEASE_SECONDS
+        selected_intent = None
         root = directory.parent
         while True:
             instance = read_json(instance_file(directory, selected["profile_id"]))
@@ -521,15 +546,22 @@ def serve_bridge(directory):
                     write_json(directory / "demand.json", {"intent": dormant["intent"]})
                     choice, _ = desktop_choice(root)
             matching = bool(choice and choice["alias"] == alias)
-            if (process_for(instance) and instance.get("model") == alias and instance.get("port")
-                    and (matching or not tracked) and await asyncio.to_thread(online, instance, "/health")):
+            if matching and selected_intent is None:
+                selected_intent = choice["intent"]
+            if selected_intent and (not matching or choice["intent"] != selected_intent):
+                raise HTTPException(409, "The Strata profile was deselected or stopped in Hermes Desktop.")
+            process = process_for(instance)
+            same_instance = instance.get("model") == alias and (matching or not tracked)
+            if process and same_instance and instance.get("port") and await asyncio.to_thread(online, instance, "/health"):
                 break
-            if not matching and (not tracked or monotonic() >= selection_grace):
-                raise HTTPException(503, "Select a different model and reselect this Strata profile in Hermes Desktop to load it.")
-            if matching and instance.get("intent") == choice["intent"] and instance.get("pid") and not process_for(instance):
+            if not matching and monotonic() >= selection_grace:
+                raise HTTPException(409, "Hermes Desktop did not confirm this Strata profile. Select it in the model picker and retry.")
+            if matching and same_instance and instance.get("intent") == choice["intent"] and instance.get("pid") and not process:
                 raise HTTPException(503, "Strata could not start this profile. Check the activity log in Strata Backend.")
             if monotonic() >= deadline:
                 raise HTTPException(503, "Strata is still loading this profile. Check the activity log and retry.")
+            if await request.is_disconnected():
+                raise HTTPException(499, "Hermes disconnected while Strata was loading.")
             await asyncio.sleep(0.5)
         client = httpx.AsyncClient(timeout=httpx.Timeout(600, connect=5), trust_env=False)
         try:
