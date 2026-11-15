@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 from pathlib import Path, PureWindowsPath
+from time import monotonic, sleep
 from urllib.parse import unquote, urlsplit
 
 
@@ -15,6 +16,25 @@ HUB = "https://huggingface.co"
 REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
 SHA = re.compile(r"[0-9a-f]{40}")
 SHARD = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf", re.IGNORECASE)
+CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+CHUNK = 1024 * 1024
+
+
+class DownloadPaused(Exception):
+    pass
+
+
+def write_transfer(root, state):
+    staged = root / ".download-state.tmp"
+    staged.write_text(json.dumps(state), encoding="utf-8")
+    for attempt in range(4):
+        try:
+            os.replace(staged, root / "download-state.json")
+            return
+        except PermissionError:
+            if attempt == 3:
+                raise
+            sleep(0.025)
 
 
 def validate_repo(repo):
@@ -168,41 +188,104 @@ def managed_dir(root, model):
     return path
 
 
-def download_file(file, folder):
-    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+def verify_file(path, file, check_pause):
+    size, sha = file.get("bytes"), file.get("sha256")
+    if size is not None and path.stat().st_size != size:
+        return False
+    if not sha:
+        return True
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(4 * CHUNK):
+            check_pause()
+            digest.update(chunk)
+    return digest.hexdigest() == sha
+
+
+def receive_file(file, part, report, check_pause):
+    import httpx
+    from huggingface_hub import hf_hub_url
+    from huggingface_hub.utils import build_hf_headers
+
+    name = file["name"]
+    size = file.get("bytes")
+    offset = part.stat().st_size if part.is_file() else 0
+    report("downloading", offset, force=True)
+    check_pause()
+    if offset and offset == size:
+        return
+    url = hf_hub_url(file["repo"], name, revision=file["revision"], endpoint=HUB)
+    headers = {**build_hf_headers(), "Accept-Encoding": "identity"}
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+    try:
+        with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=35) as response:
+            if response.status_code in (401, 403):
+                raise ValueError(f"Hugging Face denied access to {name}. Check your login and model access.")
+            if response.status_code == 206:
+                bounds = CONTENT_RANGE.fullmatch(response.headers.get("content-range", ""))
+                if not bounds or int(bounds[1]) != offset or (size is not None and int(bounds[3]) != size):
+                    raise ValueError(f"The Hub returned an unexpected byte range for {name}. The partial download was kept.")
+                size = int(bounds[3])
+            elif response.status_code != 200 or offset:
+                raise ValueError(f"The Hub did not accept this download request for {name}. The partial download was kept.")
+            elif size is None and response.headers.get("content-length", "").isdigit():
+                size = int(response.headers["content-length"])
+            if size is not None and shutil.disk_usage(part.parent).free < size - offset:
+                raise ValueError(f"Not enough free disk space for the rest of {name}.")
+            with part.open("ab" if offset else "wb") as handle:
+                for chunk in response.iter_raw(CHUNK):
+                    check_pause()
+                    if size is not None and offset + len(chunk) > size:
+                        raise ValueError(f"The download exceeded the expected file size: {name}.")
+                    handle.write(chunk)
+                    offset += len(chunk)
+                    report("downloading", offset)
+            if size is not None and offset != size:
+                raise ValueError(f"The download ended early for {name}. Resume to continue.")
+    except DownloadPaused:
+        report("downloading", offset, force=True)
+        raise
+    except httpx.HTTPError:
+        raise ValueError(f"The transfer stopped for {name}. Resume to continue from the saved bytes.") from None
+
+
+def download_file(file, folder, report, check_pause):
+    from huggingface_hub import try_to_load_from_cache
 
     name, repo, revision = file["name"], file["repo"], file["revision"]
     dest = folder / name
     if dest.resolve() != dest:
         raise ValueError("The model path must stay inside its managed folder.")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_file():
+        report("verifying", dest.stat().st_size, force=True)
+        if verify_file(dest, file, check_pause):
+            return dest
     cached = try_to_load_from_cache(repo, name, revision=revision)
-    if not dest.exists() and isinstance(cached, str) and Path(cached).is_file():
+    if isinstance(cached, str) and Path(cached).is_file():
         source = Path(cached).resolve()
-        staging = dest.with_name(dest.name + ".reuse")
-        staging.unlink(missing_ok=True)
-        try:
-            os.link(source, staging)
-        except OSError:
-            shutil.copyfile(source, staging)
-        os.replace(staging, dest)
-        print(f"Reused cached file: {name}", flush=True)
-    else:
-        try:
-            hf_hub_download(repo, name, revision=revision, local_dir=folder, endpoint=HUB)
-        except Exception as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            if status in (401, 403):
-                raise ValueError(f"Hugging Face denied access to {name}. Check your login and model access.") from None
-            raise ValueError(f"Could not download {name}. Retry to resume the download.") from None
-    size, sha = file.get("bytes"), file.get("sha256")
-    if size is not None and dest.stat().st_size != size:
-        raise ValueError(f"Download size did not match: {name}")
-    if sha:
-        print(f"Verifying {name}", flush=True)
-        with dest.open("rb") as handle:
-            if hashlib.file_digest(handle, "sha256").hexdigest() != sha:
-                raise ValueError(f"Download checksum did not match: {name}")
+        report("verifying", source.stat().st_size, force=True)
+        if verify_file(source, file, check_pause):
+            staging = dest.with_name(dest.name + ".reuse")
+            staging.unlink(missing_ok=True)
+            try:
+                os.link(source, staging)
+            except OSError:
+                shutil.copyfile(source, staging)
+            os.replace(staging, dest)
+            print(f"Reused cached file: {name}", flush=True)
+            return dest
+    pin = hashlib.sha256(f"{repo}/{revision}/{name}/{file.get('sha256')}".encode()).hexdigest()[:12]
+    part = dest.with_name(f"{dest.name}.{pin}.part")
+    if part.resolve() != part:
+        raise ValueError("The partial file must stay inside its managed folder.")
+    receive_file(file, part, report, check_pause)
+    report("verifying", part.stat().st_size, force=True)
+    if not verify_file(part, file, check_pause):
+        part.unlink()
+        raise ValueError(f"The file failed its size or checksum verification: {name}.")
+    os.replace(part, dest)
     return dest
 
 
@@ -225,11 +308,40 @@ def download_model(root, selection):
         title = group["label"]
         files = [{**f, "repo": selection["repo"], "revision": selection["revision"]} for f in group["files"]]
     print(f"Downloading {title} ({len(files)} files)", flush=True)
+    state = {"selection": selection, "title": title, "phase": "downloading", "bytes": 0,
+             "total_bytes": sum(f["bytes"] for f in files) if all(f["bytes"] is not None for f in files) else None,
+             "files": len(files), "completed_files": 0}
+    write_transfer(root, state)
+    last_report = 0.0
+    complete_bytes = 0
+
+    def check_pause():
+        if (root / "download.pause").exists():
+            raise DownloadPaused
+
+    def report(phase, bytes_written, *, force=False):
+        nonlocal last_report
+        if force or monotonic() - last_report >= 1.0:
+            state.update(phase=phase, bytes=complete_bytes + bytes_written)
+            write_transfer(root, state)
+            last_report = monotonic()
+
     paths = []
-    for file in files:
-        subfolder = folder / file["repo"].replace("/", "--") if selection["source"] == "catalog" else folder
-        path = download_file(file, subfolder)
-        paths.append(path.relative_to(folder).as_posix())
+    try:
+        for file in files:
+            check_pause()
+            state["file"] = file["name"]
+            subfolder = folder / file["repo"].replace("/", "--") if selection["source"] == "catalog" else folder
+            path = download_file(file, subfolder, report, check_pause)
+            paths.append(path.relative_to(folder).as_posix())
+            complete_bytes += path.stat().st_size
+            state["completed_files"] += 1
+            report("downloading", 0, force=True)
+    except DownloadPaused:
+        state["phase"] = "paused"
+        write_transfer(root, state)
+        print(f"Paused {title}. Completed and partial files were kept.", flush=True)
+        return
     record = {**selection, "id": identity, "title": title, "files": paths,
               "bytes": sum((folder / path).stat().st_size for path in paths),
               "artifacts": [{"path": path, "repo": file["repo"], "revision": file["revision"], "sha256": file["sha256"]}
@@ -237,6 +349,8 @@ def download_model(root, selection):
     marker = folder / "model.json.tmp"
     marker.write_text(json.dumps(record, indent=2), encoding="utf-8")
     os.replace(marker, folder / "model.json")
+    state.update(phase="complete", bytes=complete_bytes, total_bytes=complete_bytes)
+    write_transfer(root, state)
     print(f"Downloaded {title}", flush=True)
 
 

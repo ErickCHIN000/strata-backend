@@ -275,6 +275,11 @@ def strata_status():
             operation = strata_jobs.get(root)
         if operation == "wipe":
             return {"operation": operation}
+        transfer = read_transfer(root)
+        if transfer:
+            if not operation and transfer.get("phase") in {"preparing", "downloading", "verifying"}:
+                transfer["phase"] = "interrupted"
+            transfer["pause_requested"] = operation == "download" and (root / "download.pause").is_file()
         revision = strata_head(root)
         record = root / "prepared-commit"
         error = root / "setup-error.txt"
@@ -290,6 +295,7 @@ def strata_status():
                           and strata_python(root).is_file()),
             "has_data": root.exists(),
             "operation": operation,
+            "download": transfer,
             "error": error.read_text(encoding="utf-8") if error.is_file() else None,
             "log": output,
         }
@@ -354,6 +360,36 @@ def hf_environment(root):
         env.pop("HF_HOME", None)
     env.setdefault("HF_XET_CACHE", str(root / "hf-xet"))
     return env
+
+
+def read_transfer(root):
+    try:
+        data = json.loads((root / "download-state.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def pause_download(_payload):
+    try:
+        root = strata_directory()
+        with strata_jobs_lock:
+            if strata_jobs.get(root) != "download" or not read_transfer(root):
+                return {"ok": False, "error": "This download cannot be paused from the Strata tab."}
+            (root / "download.pause").touch()
+        return {"ok": True}
+    except (OSError, ValueError):
+        return {"ok": False, "error": "Could not pause the model download."}
+
+
+def resume_download(_payload):
+    try:
+        transfer = read_transfer(strata_directory())
+        if not transfer or transfer.get("phase") == "complete" or not transfer.get("selection"):
+            return {"ok": False, "error": "There is no unfinished model download."}
+        return strata_action("download", transfer["selection"])
+    except (OSError, ValueError):
+        return {"ok": False, "error": "Could not resume the model download."}
 
 
 def ensure_hf(root, env, log=None):
@@ -604,6 +640,7 @@ def run_strata_job(root: Path, operation: str, payload: dict | None) -> None:
 
 
 def change_strata(root: Path, operation: str, payload: dict | None) -> None:
+    write_transfer = None
     try:
         if root != strata_directory():
             raise ValueError("The managed Strata folder changed before the operation.")
@@ -616,6 +653,13 @@ def change_strata(root: Path, operation: str, payload: dict | None) -> None:
 
         root.mkdir(parents=True, exist_ok=True)
         (root / "setup-error.txt").unlink(missing_ok=True)
+        if operation == "download":
+            write_transfer = runpy.run_path(str(MODEL_HELPER))["write_transfer"]
+            (root / "download.pause").unlink(missing_ok=True)
+            previous = read_transfer(root) or {}
+            if previous.get("selection") != payload:
+                previous = {}
+            write_transfer(root, {**previous, "selection": payload, "phase": "preparing"})
         with (root / "setup.log").open("wb", buffering=0) as log:
             try:
                 if operation == "download":
@@ -639,6 +683,8 @@ def change_strata(root: Path, operation: str, payload: dict | None) -> None:
         message = str(exc) if isinstance(exc, ValueError) else "Could not complete the Strata operation."
         if root.is_dir() and root.resolve() == root:
             (root / "setup-error.txt").write_text(message, encoding="utf-8")
+            if operation == "download" and write_transfer:
+                write_transfer(root, {**(read_transfer(root) or {}), "selection": payload, "phase": "failed"})
 
 
 def strata_action(operation: str, payload: dict | None = None):
@@ -668,4 +714,5 @@ def strata_action(operation: str, payload: dict | None = None):
 GET_HANDLERS = {"status": strata_status, "latest": strata_latest, "models": strata_models,
                 "library": model_library, "model-options": model_option_reference}
 POST_HANDLERS = {action: partial(strata_action, action) for action in ("setup", "update", "wipe", "download")}
-POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile})
+POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile,
+                      "pause-download": pause_download, "resume-download": resume_download})

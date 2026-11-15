@@ -16,7 +16,7 @@ const preferredRepo = 'DavidAU/Qwen3.8-Flash-Next-Abliterated-Uncensored-Turbo-B
 const emptySelection = ':empty:'
 
 function ThemedSelect({ label, value, options, onChange, disabled, placeholder }) {
-  const selected = value === '' && options.some(([id]) => id === '') ? emptySelection : value
+  const selected = value === '' && options.some(([id]) => id === '') ? emptySelection : value ?? ''
   return jsxs('div', {
     children: [
       jsx('div', { children: label }),
@@ -287,16 +287,13 @@ function OptionReference({ ctx, queryScope, revision, enabled }) {
   })
 }
 
-function ModelProfiles({ ctx, queryScope, library, catalog, revision, onSave }) {
+function ModelProfiles({ ctx, queryScope, library, revision, onSave }) {
   const [draft, setDraft] = useState(() => profileDraft())
   const [saving, setSaving] = useState(false)
   const [feedback, setFeedback] = useState(null)
   const profiles = library?.profiles ?? []
   const entries = new Map((library?.models ?? []).map(model => [model.id, model.title]))
-  for (const family of catalog?.families ?? []) {
-    for (const size of family.sizes) entries.set(catalogId(family.family, size.model), `${family.title} ${size.model}`)
-  }
-  if (draft.model_id && !entries.has(draft.model_id)) entries.set(draft.model_id, 'Previously selected model')
+  const missingModel = draft.model_id && !entries.has(draft.model_id)
 
   function edit(name, value) {
     setDraft(previous => ({ ...previous, [name]: value }))
@@ -343,9 +340,11 @@ function ModelProfiles({ ctx, queryScope, library, catalog, revision, onSave }) 
             })],
           }),
           jsx(ThemedSelect, {
-            label: 'Model', value: draft.model_id, disabled: saving, onChange: id => edit('model_id', id),
+            label: 'Model', value: missingModel ? null : draft.model_id, disabled: saving,
+            placeholder: 'Saved model not downloaded', onChange: id => edit('model_id', id),
             options: [['', 'Any model'], ...entries],
           }),
+          missingModel && jsx('p', { className: 'text-(--ui-text-secondary)', children: 'This profile keeps its saved model until you choose another option.' }),
           jsx('div', {
             className: 'grid gap-2 sm:grid-cols-2',
             children: controls.map(control => jsxs('label', {
@@ -373,6 +372,45 @@ function ModelProfiles({ ctx, queryScope, library, catalog, revision, onSave }) 
           jsx('div', { children: jsx('button', { type: 'submit', className: buttonClass, disabled: saving, children: saving ? 'Saving…' : 'Save profile' }) }),
           feedback && jsx('p', { role: feedback.error ? 'alert' : 'status', children: feedback.message }),
         ],
+      }),
+    ],
+  })
+}
+
+function DownloadProgress({ transfer, active, busy, pausing, onPause, onResume }) {
+  if (!transfer) {
+    return active && jsx('p', { children: 'This download started with an older plugin version. Progress and pause are available on new transfers.' })
+  }
+  const percent = transfer.total_bytes ? Math.min(100, Math.round((transfer.bytes ?? 0) / transfer.total_bytes * 100)) : null
+  const phaseLabels = {
+    preparing: 'Preparing download', downloading: 'Downloading', verifying: 'Verifying file',
+    paused: 'Paused', interrupted: 'Interrupted', failed: 'Download failed', complete: 'Download complete',
+  }
+  const resume = !active && ['paused', 'failed', 'interrupted'].includes(transfer.phase)
+  const phase = transfer.pause_requested || pausing ? 'Pausing…' : phaseLabels[transfer.phase]
+  const amount = transfer.bytes == null ? null : `${downloadSize(transfer.bytes)}${transfer.total_bytes ? ` / ${downloadSize(transfer.total_bytes)}` : ''}`
+  return jsxs('section', {
+    className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-3',
+    children: [
+      jsx('h2', { className: 'font-medium', children: transfer.title ?? 'Model download' }),
+      jsx('p', { children: [phase, amount, percent == null ? null : `${percent}%`].filter(Boolean).join(' · ') }),
+      percent != null && jsx('div', {
+        role: 'progressbar', 'aria-label': 'Model download progress', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent,
+        className: 'h-2 overflow-hidden rounded-full bg-(--ui-stroke-secondary)',
+        children: jsx('div', { className: 'h-full bg-(--ui-accent)', style: { width: `${percent}%` } }),
+      }),
+      active && transfer.file && jsx('p', {
+        className: 'break-words text-(--ui-text-secondary)',
+        children: `File ${Math.min(transfer.completed_files + 1, transfer.files)} of ${transfer.files} · ${transfer.file}`,
+      }),
+      active && transfer.phase !== 'complete' && jsx('div', {
+        children: jsx('button', {
+          type: 'button', className: buttonClass, onClick: onPause,
+          disabled: pausing || transfer.pause_requested || transfer.phase === 'paused', children: 'Pause download',
+        }),
+      }),
+      resume && jsx('div', {
+        children: jsx('button', { type: 'button', className: buttonClass, disabled: busy, onClick: onResume, children: 'Resume download' }),
       }),
     ],
   })
@@ -424,6 +462,7 @@ function StrataPage({ ctx }) {
   const [requesting, setRequesting] = useState(false)
   const [confirmWipe, setConfirmWipe] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const [pausing, setPausing] = useState(false)
   const pending = requesting || Boolean(data?.operation)
   const needsRestart = status.isError && /\b404\b/.test(String(status.error))
 
@@ -447,7 +486,7 @@ function StrataPage({ ctx }) {
       haptic('tap')
       const result = await ctx.rest(`/runtime/${operation}`, body ? { method: 'POST', body } : { method: 'POST' })
       if (!result.ok) throw new Error(result.error || 'The operation failed.')
-      queryClient.setQueryData(statusKey, previous => ({ ...previous, operation }))
+      queryClient.setQueryData(statusKey, previous => ({ ...previous, operation: result.operation ?? operation }))
       await queryClient.invalidateQueries({ queryKey: statusKey, exact: true })
       await queryClient.invalidateQueries({ queryKey: libraryKey, exact: true })
     } catch (error) {
@@ -455,6 +494,20 @@ function StrataPage({ ctx }) {
     } finally {
       requestLock.current = false
       setRequesting(false)
+    }
+  }
+
+  async function pauseDownload() {
+    if (pausing) return
+    setPausing(true)
+    try {
+      const result = await ctx.rest('/runtime/pause-download', { method: 'POST' })
+      if (!result.ok) throw new Error(result.error || 'Could not pause the download.')
+      await status.refetch()
+    } catch (error) {
+      host.notifyError(error, 'Could not pause the model download')
+    } finally {
+      setPausing(false)
     }
   }
 
@@ -561,6 +614,10 @@ function StrataPage({ ctx }) {
           }),
         ],
       }),
+      jsx(DownloadProgress, {
+        transfer: data?.download, active: data?.operation === 'download', busy: pending || !connected, pausing,
+        onPause: () => void pauseDownload(), onResume: () => void run('resume-download'),
+      }),
       data?.log && jsxs('details', {
         children: [
           jsx('summary', { className: 'cursor-pointer', children: 'Activity log' }),
@@ -589,7 +646,7 @@ function StrataPage({ ctx }) {
       }),
       (library.isError || library.data?.error) && jsx('p', { role: 'alert', children: library.data?.error ?? 'Could not load model downloads and profiles.' }),
       library.data?.profiles && jsx(ModelProfiles, {
-        ctx, queryScope, library: library.data, catalog: models.data, revision: data?.ready ? data.revision : null,
+        ctx, queryScope, library: library.data, revision: data?.ready ? data.revision : null,
         onSave: () => queryClient.invalidateQueries({ queryKey: libraryKey, exact: true }),
       }, `profiles:${scopeKey}`),
     ],
