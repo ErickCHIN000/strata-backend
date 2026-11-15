@@ -188,6 +188,37 @@ def online(record, path, timeout=0.6):
         return False
 
 
+def performance_stats(record):
+    try:
+        request = Request(f"http://127.0.0.1:{int(record['port'])}/metrics",
+                          headers={"Authorization": f"Bearer {record['key']}", "Accept": "application/json"})
+        with urlopen(request, timeout=0.6) as response:
+            metrics = json.load(response)
+        if metrics["engine"]["model"] != record["model"]:
+            return None
+        hardware, live = metrics["hardware"], metrics["live"]
+        recent = []
+        for sample in metrics["requests"][:3]:
+            prompt_tokens, prompt_ms = sample.get("prompt_read"), sample.get("prompt_ms")
+            recent.append({
+                "generation_tps": sample.get("decode_tok_s"),
+                "generated": sample.get("engine_generated"),
+                "prompt_tps": round(1000 * prompt_tokens / prompt_ms, 1) if prompt_tokens and prompt_ms else None,
+                "prompt_read": prompt_tokens,
+                "prompt_total": sample.get("prompt_total"),
+            })
+        return {
+            "generation_tps": live.get("tok_s_mean"),
+            "prompt_tps": live.get("prefill_tok_s_mean"),
+            "ram_used": hardware.get("ram_used"), "ram_total": hardware.get("ram_total"),
+            "vram_used": hardware.get("gpu_mem_used"), "vram_total": hardware.get("gpu_mem_total"),
+            "expert_cache_mib": metrics["engine"].get("expert_cache_mib"),
+            "recent": recent,
+        }
+    except (OSError, KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
 def write_provider_config(provider, roster):
     from hermes_cli.config import _CONFIG_LOCK, get_config_path, require_readable_config_before_write, save_config
 
@@ -293,6 +324,58 @@ def windows_commit_available():
     return None
 
 
+def prepare_external_flash_next(root, profile, weights):
+    source = root / "source"
+    tools = source / "tools"
+    sys.path.insert(0, str(tools))
+    from gguf_reader import GGUFFile
+
+    headers = [GGUFFile(path) for path in weights]
+    architecture = headers[0].metadata.get("general.architecture")
+    if architecture != "qwen4exp":
+        raise ValueError(f"External GGUF architecture {architecture or 'unknown'} is unsupported. The custom pack path requires Qwen Flash-Next (qwen4exp).")
+    tables = [header.path for header in headers if any(tensor.name == "per_layer_token_embd.weight" for tensor in header.tensors)]
+    if len(tables) != 1:
+        raise ValueError("The Flash-Next GGUF shards must contain exactly one per-layer token embedding table.")
+    if profile.get("setup_args") or profile.get("launch_args"):
+        raise ValueError("For a custom Flash-Next pack, use Engine arguments and Server arguments in the profile.")
+
+    binary = "strata.exe" if os.name == "nt" else "strata"
+    engine = next((source / name / binary for name in ("engine", "engine-cuda12")
+                   if (source / name / binary).is_file()), None)
+    if engine is None:
+        raise ValueError("Set up the native Strata engine before preparing a custom Flash-Next pack.")
+    gguf_py = source / "third_party" / "llama.cpp" / "gguf-py"
+    model_folder = weights[0].relative_to(root / "models").parts[0]
+    pack = root / "run-data" / "packs" / f"external-{model_folder}"
+    revision = (root / "prepared-commit").read_text(encoding="ascii").strip()
+    stamp = pack / "strata-revision.json"
+    tokenizer = pack / "tokenizer"
+    if (read_json(stamp).get("revision") != revision or not (pack / "native_experts.txt").is_file()
+            or not (tokenizer / "chat_template.jinja").is_file() or not (tokenizer / "vocab.json").is_file()):
+        print("Preparing custom Flash-Next pack from the downloaded GGUF shards.", flush=True)
+        subprocess.run([sys.executable, "-B", str(tools / "iq_pack.py"), "--gguf", str(weights[0]),
+                        "--out", str(pack), "--compat-bf16"], cwd=source,
+                       env={**os.environ, "STRATA_GGUF_PY": str(gguf_py)}, check=True)
+        write_json(stamp, {"revision": revision})
+
+    context = str(profile.get("controls", {}).get("--max-context") or 32768)
+    args = ["--pack", str(pack), "--native", str(weights[0]), "--ple-gguf", str(tables[0]),
+            "--expert-profile", str(source / "data" / "expert-profile.bin"), "--expert-cache", "auto",
+            "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--max-context", context,
+            "--kv", "int8", "--kv-resident", str(min(int(context), 32768)), "--resident-experts"]
+    draft = root / "run-data" / "mtp" / "rt"
+    drafting = (profile.get("config") or {}).get("drafting", "off")
+    if drafting == "mtp":
+        if not (draft / "experts.bin").is_file():
+            raise ValueError("Prepare the shared Flash-Next MTP draft layer before enabling it for this model.")
+        args.extend(("--mtp", str(draft)))
+    build = read_json(engine.parent / "BUILD.json")
+    return {"exe": str(engine), "cwd": str(source), "tokenizer": str(tokenizer),
+            "log": str(pack / "engine.log"), "drafting": drafting, "args": args,
+            "lib_dirs": build.get("lib_dirs") or build.get("cuda_dirs") or []}
+
+
 def prepare_config(root, profile, model, destination):
     source = root / "source"
     sys.path.insert(0, str(source))
@@ -304,7 +387,8 @@ def prepare_config(root, profile, model, destination):
     else:
         match = strata.gguf_choice(weights[0].name)
         if match is None:
-            raise ValueError("This external GGUF does not match a Strata catalog pack. Its serving compatibility needs a separate test.")
+            write_json(destination, prepare_external_flash_next(root, profile, weights))
+            return
         family, size = match
     fam = (strata.FAMILIES.get(family) or strata.OWN_PATH_FAMILIES.get(family) or {})
     if not fam or fam.get("ready"):
@@ -419,6 +503,8 @@ def log_tail(path, limit):
 
 def preparation_progress(output):
     for line in reversed(output.splitlines()):
+        if line == "Preparing custom Flash-Next pack from the downloaded GGUF shards.":
+            return {"stage": "packing-model"}
         if line.lstrip().startswith("> "):
             tool = re.search(r"\bmtp_(fetch|pack|rt)\.py\b", line)
             if tool:
@@ -432,7 +518,7 @@ def preparation_progress(output):
     return {}
 
 
-def instance_rows(root):
+def instance_rows(root, *, include_stats=False):
     directory = service_root(root)
     rows = []
     owned_pids = set()
@@ -454,7 +540,9 @@ def instance_rows(root):
         row = {"pid": config.get("pid"), "started": config.get("started"), "name": config.get("name"),
                "profile_id": config.get("profile_id"), "managed": True, "state": state, "port": config.get("port")}
         logfile = file.with_suffix(".log")
-        if state == "preparing":
+        if state == "ready" and include_stats:
+            row["stats"] = performance_stats(config)
+        elif state == "preparing":
             row.update(preparation_progress(log_tail(root / "setup.log", 16384)))
         elif state in ("starting", "exited"):
             row["log"] = log_tail(logfile, 1800)

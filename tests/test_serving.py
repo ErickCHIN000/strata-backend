@@ -1,6 +1,10 @@
+import io
+import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -10,6 +14,41 @@ from dashboard import serving
 
 
 class ServingTests(unittest.TestCase):
+    def test_performance_exposes_counters_without_request_content(self):
+        metrics = {"engine": {"model": "iq3", "expert_cache_mib": 7966},
+                   "live": {"tok_s_mean": 88.5}, "hardware": {"ram_used": 40 << 30, "gpu_mem_used": 18 << 30},
+                   "requests": [{"decode_tok_s": 89.4, "engine_generated": 1180,
+                                 "prompt_read": 15984, "prompt_total": 16000, "prompt_ms": 4540.9,
+                                 "prompt": "private request"}]}
+        with patch.object(serving, "urlopen", return_value=io.BytesIO(json.dumps(metrics).encode())):
+            stats = serving.performance_stats({"port": 12345, "key": "test", "model": "iq3"})
+        self.assertEqual(stats["generation_tps"], 88.5)
+        self.assertEqual(stats["ram_used"], 40 << 30)
+        self.assertEqual(stats["recent"], [{"generation_tps": 89.4, "generated": 1180,
+                                            "prompt_tps": 3520.0, "prompt_read": 15984, "prompt_total": 16000}])
+
+    def test_external_flash_next_pack_uses_each_models_own_tokenizer_and_ple(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            engine = source / "engine" / ("strata.exe" if os.name == "nt" else "strata")
+            engine.parent.mkdir(parents=True)
+            engine.touch()
+            (root / "prepared-commit").write_text("revision", encoding="ascii")
+            first, second = (root / "models" / "model-id" / f"custom-{index}.gguf" for index in (1, 2))
+            pack = root / "run-data" / "packs" / "external-model-id"
+
+            def header(path):
+                return SimpleNamespace(path=path, metadata={"general.architecture": "qwen4exp"},
+                                       tensors=[SimpleNamespace(name="per_layer_token_embd.weight")] if path == second else [])
+
+            with patch.dict("sys.modules", {"gguf_reader": SimpleNamespace(GGUFFile=header)}), \
+                    patch.object(serving.sys, "path", serving.sys.path.copy()), patch.object(serving.subprocess, "run") as run:
+                config = serving.prepare_external_flash_next(root, {}, [first, second])
+            self.assertIn("--compat-bf16", run.call_args.args[0])
+            self.assertEqual(config["tokenizer"], str(pack / "tokenizer"))
+            self.assertEqual(config["args"][config["args"].index("--ple-gguf") + 1], str(second))
+
     def test_mtp_progress_tracks_latest_stage(self):
         fetch = "  > python tools/mtp_fetch.py fetch\n  MTP draft layer: 1.23 / 5.21 GB (24%)"
         pack = fetch + "\n  > python tools/mtp_pack.py --experts q2_0\npacking tensors"

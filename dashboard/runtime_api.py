@@ -500,7 +500,7 @@ def serving_status():
         roster = tools["model_roster"](model_library())
         directory = tools["service_root"](root)
         provider = tools["read_json"](directory / "provider.json")
-        instances = tools["instance_rows"](root)
+        instances = tools["instance_rows"](root, include_stats=True)
         return {"models": [{"id": alias, **item} for alias, item in roster.items()],
                 "provider_ready": any(row.get("provider") and row["state"] == "ready" for row in instances) and bool(provider.get("key")),
                 "instances": instances}
@@ -570,6 +570,88 @@ def sync_serving_profiles(root):
     if (root / "serving" / "provider.json").is_file():
         tools = serving_tools()
         tools["sync_provider"](root, tools["model_roster"](model_library()))
+
+
+def delete_library_entry(kind, payload):
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.plugins_auto_update import plugin_update_lock
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    try:
+        root = strata_directory()
+        item_id = (payload or {}).get("id")
+        tools = serving_tools()
+        with plugin_update_lock(root), strata_jobs_lock:
+            if root in strata_jobs:
+                raise ValueError("Wait for the current Strata operation to finish.")
+            library = model_library()
+            if library.get("error"):
+                raise ValueError(library["error"])
+            profiles = library["profiles"]
+            if kind == "model":
+                if not isinstance(item_id, str) or not 0 < len(item_id) <= 1200:
+                    raise ValueError("Choose a downloaded model.")
+                downloads = runpy.run_path(str(MODEL_HELPER))
+                path = downloads["managed_dir"](root, item_id)
+                record = tools["read_json"](path / "model.json")
+                if record.get("id") != item_id:
+                    raise ValueError("That downloaded model could not be found.")
+                affected = {p["id"] for p in profiles if p.get("model_id") == item_id}
+            else:
+                item_id = tools["profile_id"](item_id)
+                path = profile_directory(root) / f"{item_id}.json"
+                if path.resolve() != path or not any(p["id"] == item_id for p in profiles):
+                    raise ValueError("That saved profile could not be found.")
+                affected = {item_id}
+
+            model_config = load_config_readonly().get("model")
+            default = (model_config.get("default") if isinstance(model_config, dict) else model_config)
+            roster = tools["model_roster"](library)
+            if any(alias == default and item["profile_id"] in affected for alias, item in roster.items()):
+                raise ValueError("Choose a different Hermes default model before deleting this item.")
+            directory = tools["service_root"](root)
+            for row in tools["instance_rows"](root):
+                key = row.get("profile_id")
+                if row["state"] == "exited" or not key:
+                    continue
+                prepared = tools["read_json"](directory / "configs" / f"{tools['profile_id'](key)}.prepare.json")
+                running_model = (prepared.get("model") or {}).get("id")
+                if key in affected or (kind == "model" and running_model == item_id):
+                    raise ValueError("Stop the Strata profile using this item before deleting it.")
+
+            if kind == "model":
+                # Keep the marker until the files are gone so a failed unlink can be retried.
+                marker = path / "model.json"
+                for entry in path.iterdir():
+                    if entry == marker:
+                        continue
+                    if entry.is_dir() and not entry.is_symlink() and not getattr(entry, "is_junction", lambda: False)():
+                        if entry.resolve() != entry:
+                            raise ValueError("A model download subfolder moved outside its managed directory.")
+                        shutil.rmtree(entry)
+                    else:
+                        entry.unlink()
+                marker.unlink()
+                path.rmdir()
+                selection = (read_transfer(root) or {}).get("selection")
+                if isinstance(selection, dict) and selection and all(record.get(key) == value for key, value in selection.items()):
+                    try:
+                        (root / "download-state.json").unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            else:
+                path.unlink()
+            try:
+                sync_serving_profiles(root)
+            except (ValueError, OSError, ImportError):
+                return {"ok": True, "warning": "Deleted. Refresh the Strata provider to update the model picker."}
+            return {"ok": True}
+    except (ValueError, PluginOperationError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except PermissionError:
+        return {"ok": False, "error": "A file is in use or access was denied. Close apps using the files and retry."}
+    except (OSError, TypeError):
+        return {"ok": False, "error": "Could not delete the selected Strata item."}
 
 
 def start_serving_profile(payload):
@@ -660,16 +742,18 @@ def save_model_profile(payload):
         content = json.dumps(profile, indent=2, allow_nan=False)
         if len(content) > 256_000:
             raise ValueError("This model profile is too large.")
-        directory = profile_directory(strata_directory())
-        directory.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(dir=directory) as temp:
-            staged = Path(temp) / "profile.json"
-            staged.write_text(content, encoding="utf-8")
-            os.replace(staged, directory / f"{profile_id}.json")
-        try:
-            sync_serving_profiles(strata_directory())
-        except (ValueError, OSError, ImportError):
-            return {"ok": True, "profile": profile, "warning": "Profile saved. Refresh the Strata provider to update the model picker."}
+        root = strata_directory()
+        directory = profile_directory(root)
+        with strata_jobs_lock:
+            directory.mkdir(parents=True, exist_ok=True)
+            with TemporaryDirectory(dir=directory) as temp:
+                staged = Path(temp) / "profile.json"
+                staged.write_text(content, encoding="utf-8")
+                os.replace(staged, directory / f"{profile_id}.json")
+            try:
+                sync_serving_profiles(root)
+            except (ValueError, OSError, ImportError):
+                return {"ok": True, "profile": profile, "warning": "Profile saved. Refresh the Strata provider to update the model picker."}
         return {"ok": True, "profile": profile}
     except (TypeError, ValueError, OverflowError) as exc:
         return {"ok": False, "error": str(exc)}
@@ -857,6 +941,8 @@ GET_HANDLERS = {"status": strata_status, "latest": strata_latest, "models": stra
                 "library": model_library, "model-options": model_option_reference, "serving": serving_status}
 POST_HANDLERS = {action: partial(strata_action, action) for action in ("setup", "update", "wipe", "download")}
 POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile,
+                      "delete-model": partial(delete_library_entry, "model"),
+                      "delete-profile": partial(delete_library_entry, "profile"),
                       "pause-download": pause_download, "resume-download": resume_download,
                       "setup-provider": setup_hermes_provider, "start-profile": start_serving_profile,
                       "stop-instance": stop_serving_instance, "desktop-selection": desktop_selection})

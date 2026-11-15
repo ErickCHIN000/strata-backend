@@ -23,9 +23,11 @@ The transfer panel shows bytes received, the current shard, verification, and co
 
 Under **Hugging Face models**, enter an `owner/repo` and optionally an exact GGUF filename or quantization. For example, enter `unsloth/Qwen3.8-27B-GGUF` and `Qwen3.8-27B-UD-Q4_K_M.gguf`. The picker groups complete shard sets. The Hub client runs in the managed venv and uses the existing Hugging Face login and cache. External GGUF downloads are listed with compatibility unverified.
 
-The DavidAU Flash-Next shortcut points to two raw `IQ3_S` shards and a separate vision projector. The downloaded model needs a Strata pack prepared separately before a compatibility test.
+The **Use SC117 Flash-Next IQ3_S** shortcut fills the model repository and quantization. For custom Qwen Flash-Next GGUFs, the first launch builds a separate text-only pack using the model’s own tokenizer. Custom packs use the profile’s Engine and Server arguments. Setting the run config’s `drafting` to `mtp` uses the already-prepared shared Flash-Next MTP layer.
 
 **Model profiles** save common memory and context settings, raw Strata engine, launch, setup and server arguments, environment variables, and run config overrides. The option reference comes from the installed build. The Model picker lists completed downloads, and **Any model** creates a reusable preset. Fresh wipe preserves profiles and the shared Hugging Face cache.
+
+Use **Delete model** under **Downloaded models** to remove that download from the managed model folder. Use **Delete profile** under **Model profiles** to remove the selected preset. Both ask for confirmation. Stop a running profile and switch the Hermes default away from it before deleting it or its download.
 
 ## Use a profile in Hermes
 
@@ -33,7 +35,7 @@ The DavidAU Flash-Next shortcut points to two raw `IQ3_S` shards and a separate 
 2. Select the profile in the model picker. Strata prepares its pack from the downloaded GGUFs and starts the local server. A restored picker value stays cold until you send a prompt to it or make a new selection. The first prompt waits for launch. For the baseline, vision and the optional draft download are off. On Windows, Strata uses resident low-RAM mode when available commit is smaller than the expert arena unless the profile specifies a low-RAM mode.
 3. The plugin follows confirmed switches in live sessions. Selecting another Strata profile unloads the previous one. Choosing a cloud model unloads the model and keeps the lightweight provider available for later selection. Closing the final Desktop window releases both. If the close signal is interrupted, the backend cleans up after the last heartbeat expires.
 
-**Strata processes** lists managed instances and detected external Strata engines or servers. **Stop process** unloads the selected managed model. Send a new message to the same profile or select it again to load it with its latest saved settings. Automatic unloading applies to plugin-managed instances. Managed source serving currently supports GGUF weights that Strata’s own-files setup recognizes. Separate-engine and ready-pack formats need their own serving setup.
+**Strata processes** lists managed instances and detected external Strata engines or servers. Running managed profiles show live timing when available, the three most recent requests, and current system RAM and GPU VRAM usage. **Stop process** unloads the selected managed model. Send a new message to the same profile or select it again to load it with its latest saved settings. Automatic unloading applies to plugin-managed instances. Separate-engine and ready-pack formats need their own serving setup.
 
 On upgrading from v0.2.2 or earlier, use the **Restart gateway** button in the Strata tab to activate the new Python router once. Updates to the plugin's runtime handlers are then picked up on the next request through that router.
 

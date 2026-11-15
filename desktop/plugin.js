@@ -1,6 +1,6 @@
 import {
   ROUTES_AREA, SIDEBAR_NAV_AREA, STATUSBAR_AREAS, host, haptic, useQuery, queryClient, useValue,
-  Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
+  ConfirmDialog, Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
 } from '@hermes/plugin-sdk'
 import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -12,7 +12,7 @@ const pluginUpdateInterval = 2 * 60 * 1000
 const buttonClass = 'rounded-md border border-(--ui-stroke-secondary) px-3 py-1.5 text-sm hover:text-(--ui-accent) disabled:opacity-50'
 const inputClass = 'w-full rounded-md border border-(--ui-stroke-secondary) bg-transparent px-2 py-1.5 text-sm'
 const sectionClass = 'flex flex-col gap-3 border-t border-(--ui-stroke-secondary) pt-4'
-const preferredRepo = 'DavidAU/Qwen3.8-Flash-Next-Abliterated-Uncensored-Turbo-Brilliance-50x-Reasoning-Instruct-GSQ-RCO-GGUF'
+const preferredRepo = 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF'
 const emptySelection = ':empty:'
 
 function ThemedSelect({ label, value, options, onChange, disabled, placeholder }) {
@@ -162,7 +162,6 @@ function HuggingFaceModels({ ctx, downloads, busy, onDownload }) {
 
   const selection = group && { source: 'hf', repo: catalog.repo, revision: catalog.revision, group: group.id }
   const downloaded = selection && downloads.has(`hf:${selection.repo}@${selection.revision}:${selection.group}`)
-  const needsPack = catalog?.repo.toLowerCase() === preferredRepo.toLowerCase()
   return jsxs('section', {
     className: sectionClass,
     children: [
@@ -191,8 +190,8 @@ function HuggingFaceModels({ ctx, downloads, busy, onDownload }) {
               }),
               jsx('button', {
                 type: 'button', className: buttonClass, disabled: reading,
-                onClick: () => { setRepo(preferredRepo); setFilename(''); clearLookup() },
-                children: 'Use DavidAU Flash-Next repo',
+                onClick: () => { setRepo(preferredRepo); setFilename('IQ3_S'); clearLookup() },
+                children: 'Use SC117 Flash-Next IQ3_S',
               }),
             ],
           }),
@@ -219,10 +218,6 @@ function HuggingFaceModels({ ctx, downloads, busy, onDownload }) {
           jsx('span', { children: `${group.files.length} ${group.files.length === 1 ? 'file' : 'files'}${group.bytes == null ? '' : ` · ${downloadSize(group.bytes)}`}` }),
           jsx('span', { className: 'text-(--ui-text-secondary)', children: 'Raw GGUF · Strata compatibility unverified' }),
         ],
-      }),
-      needsPack && jsx('p', {
-        className: 'text-(--ui-text-secondary)',
-        children: 'The DavidAU model ships as GGUF shards. Prepare a Strata pack from the shards separately before trying to run it.',
       }),
     ],
   })
@@ -287,11 +282,36 @@ function OptionReference({ ctx, queryScope, revision, enabled }) {
   })
 }
 
-function ModelProfiles({ ctx, queryScope, library, revision, onSave }) {
+function LibraryDeleteDialog({ ctx, target, onClose, onDeleted }) {
+  return jsx(ConfirmDialog, {
+    open: true,
+    destructive: true,
+    title: target.kind === 'model' ? 'Delete downloaded model?' : 'Delete saved profile?',
+    description: target.kind === 'model'
+      ? `Are you sure you want to delete the downloaded files for “${target.name}”? Its saved profiles will remain.`
+      : `Are you sure you want to delete “${target.name}”? Its downloaded model will remain.`,
+    confirmLabel: 'Delete',
+    busyLabel: 'Deleting…',
+    doneLabel: 'Deleted',
+    onClose,
+    onConfirm: async () => {
+      const result = await ctx.rest(`/runtime/delete-${target.kind}`, {
+        method: 'POST', body: { id: target.id }, timeoutMs: 60_000,
+      })
+      if (!result.ok) throw new Error(result.error || 'Could not delete the selected item.')
+      if (result.warning) host.notify({ kind: 'info', message: result.warning })
+      await onDeleted()
+    },
+  })
+}
+
+function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
   const [draft, setDraft] = useState(() => profileDraft())
   const [saving, setSaving] = useState(false)
   const [feedback, setFeedback] = useState(null)
+  const [deleteProfile, setDeleteProfile] = useState(null)
   const profiles = library?.profiles ?? []
+  const savedProfile = profiles.find(profile => profile.id === draft.id)
   const entries = new Map((library?.models ?? []).map(model => [model.id, model.title]))
   const missingModel = draft.model_id && !entries.has(draft.model_id)
 
@@ -369,9 +389,24 @@ function ModelProfiles({ ctx, queryScope, library, revision, onSave }) {
             ],
           }),
           jsx(OptionReference, { ctx, queryScope, revision, enabled: Boolean(revision) }),
-          jsx('div', { children: jsx('button', { type: 'submit', className: buttonClass, disabled: saving, children: saving ? 'Saving…' : 'Save profile' }) }),
+          jsxs('div', { className: 'flex flex-wrap gap-2', children: [
+            jsx('button', { type: 'submit', className: buttonClass, disabled: saving, children: saving ? 'Saving…' : 'Save profile' }),
+            savedProfile && jsx('button', {
+              type: 'button', className: buttonClass, disabled: saving || busy,
+              onClick: () => setDeleteProfile({ kind: 'profile', id: savedProfile.id, name: savedProfile.name }),
+              children: 'Delete profile',
+            }),
+          ] }),
           feedback && jsx('p', { role: feedback.error ? 'alert' : 'status', children: feedback.message }),
         ],
+      }),
+      deleteProfile && jsx(LibraryDeleteDialog, {
+        ctx, target: deleteProfile, onClose: () => setDeleteProfile(null),
+        onDeleted: async () => {
+          setDraft(profileDraft())
+          setFeedback(null)
+          await onSave()
+        },
       }),
     ],
   })
@@ -419,9 +454,53 @@ function DownloadProgress({ transfer, active, busy, pausing, onPause, onResume }
 function startupLabel(row) {
   if (row?.stage === 'downloading-mtp') return ['Downloading MTP', row.detail].filter(Boolean).join(' · ')
   if (row?.stage === 'packing-mtp') return 'Packing MTP'
+  if (row?.stage === 'packing-model') return 'Packing model'
   if (row?.stage === 'loading-model' || row?.state === 'starting') return 'Loading model'
   if (row?.state === 'preparing') return 'Preparing model files'
   return row?.state
+}
+
+function ServingStats({ stats }) {
+  const rate = value => Number.isFinite(value) ? `${value.toLocaleString()} tok/s` : '—'
+  const memory = (used, total) => Number.isFinite(used) && Number.isFinite(total)
+    ? `${(used / 2 ** 30).toFixed(1)} / ${(total / 2 ** 30).toFixed(1)} GiB` : '—'
+  const live = Number.isFinite(stats.generation_tps) || Number.isFinite(stats.prompt_tps)
+  return jsxs('div', {
+    className: 'mt-2 grid gap-2',
+    children: [
+      jsx('dl', {
+        className: 'grid grid-cols-2 gap-x-4 gap-y-1',
+        children: [
+          ['System RAM', memory(stats.ram_used, stats.ram_total)],
+          ['GPU VRAM', memory(stats.vram_used, stats.vram_total)],
+          Number.isFinite(stats.expert_cache_mib) && ['GPU expert cache', `${(stats.expert_cache_mib / 1024).toFixed(1)} GiB`],
+          live && ['Live generation', rate(stats.generation_tps)],
+          live && ['Live prompt processing', rate(stats.prompt_tps)],
+        ].filter(Boolean).map(([label, value]) => jsxs('div', {
+          children: [
+            jsx('dt', { className: 'text-(--ui-text-secondary)', children: label }),
+            jsx('dd', { className: 'tabular-nums', children: value }),
+          ],
+        }, label)),
+      }),
+      stats.recent.length > 0 && jsxs('table', {
+        className: 'w-full text-left text-xs tabular-nums',
+        children: [
+          jsx('caption', { className: 'text-left text-(--ui-text-secondary)', children: 'Recent Strata requests, newest first' }),
+          jsx('thead', { children: jsxs('tr', { children: [
+            jsx('th', { scope: 'col', className: 'pr-3 font-medium', children: 'Generation' }),
+            jsx('th', { scope: 'col', className: 'font-medium', children: 'Prompt processing' }),
+          ] }) }),
+          jsx('tbody', { children: stats.recent.map((sample, index) => jsxs('tr', { children: [
+            jsx('td', { className: 'pr-3', children: Number.isFinite(sample.generated)
+              ? `${rate(sample.generation_tps)} · ${sample.generated.toLocaleString()} tokens` : rate(sample.generation_tps) }),
+            jsx('td', { children: Number.isFinite(sample.prompt_read) && Number.isFinite(sample.prompt_total)
+              ? `${rate(sample.prompt_tps)} · ${sample.prompt_read.toLocaleString()} of ${sample.prompt_total.toLocaleString()} read` : rate(sample.prompt_tps) }),
+          ] }, index)) }),
+        ],
+      }),
+    ],
+  })
 }
 
 function ServingControls({ ctx, serving }) {
@@ -462,6 +541,7 @@ function ServingControls({ ctx, serving }) {
             jsxs('div', { className: 'min-w-0 break-words', children: [
               jsx('div', { children: `${row.name} · ${startupLabel(row)}` }),
               jsx('div', { className: 'text-(--ui-text-secondary)', children: [row.managed ? 'Managed' : 'External', row.pid && `PID ${row.pid}`, row.path].filter(Boolean).join(' · ') }),
+              row.stats && jsx(ServingStats, { stats: row.stats }),
               row.log && jsxs('details', { children: [jsx('summary', { children: 'Server log' }),
                 jsx('pre', { className: 'max-h-48 overflow-auto whitespace-pre-wrap text-xs', children: row.log })] }),
             ] }),
@@ -534,6 +614,7 @@ function StrataPage({ ctx }) {
   const requestLock = useRef(false)
   const [requesting, setRequesting] = useState(false)
   const [confirmWipe, setConfirmWipe] = useState(false)
+  const [deleteModel, setDeleteModel] = useState(null)
   const [restarting, setRestarting] = useState(false)
   const [pausing, setPausing] = useState(false)
   const pending = requesting || Boolean(data?.operation)
@@ -708,20 +789,36 @@ function StrataPage({ ctx }) {
           jsx('ul', {
             className: 'divide-y divide-(--ui-stroke-secondary)',
             children: modelDownloads.map(model => jsxs('li', {
-              className: 'break-words py-2',
-              children: [jsx('div', { children: model.title }), jsx('div', {
-                className: 'text-(--ui-text-secondary)',
-                children: [model.repo, downloadSize(model.bytes), model.source === 'hf'
-                  ? model.repo?.toLowerCase() === preferredRepo.toLowerCase() ? 'Strata pack needed' : 'Raw GGUF, compatibility unverified'
-                  : null].filter(Boolean).join(' · '),
-              })],
+              className: 'flex flex-wrap items-center justify-between gap-2 py-2',
+              children: [
+                jsxs('div', { className: 'min-w-0 break-words', children: [
+                  jsx('div', { children: model.title }),
+                  jsx('div', {
+                    className: 'text-(--ui-text-secondary)',
+                    children: [model.repo, downloadSize(model.bytes)].filter(Boolean).join(' · '),
+                  }),
+                ] }),
+                jsx('button', {
+                  type: 'button', className: buttonClass, disabled: !connected || pending,
+                  'aria-label': `Delete ${model.title}`,
+                  onClick: () => setDeleteModel({ kind: 'model', id: model.id, name: model.title, scope: scopeKey }),
+                  children: 'Delete model',
+                }),
+              ],
             }, model.id)),
           }),
         ],
       }),
+      deleteModel?.scope === scopeKey && jsx(LibraryDeleteDialog, {
+        ctx, target: deleteModel, onClose: () => setDeleteModel(null),
+        onDeleted: async () => {
+          await queryClient.invalidateQueries({ queryKey: libraryKey, exact: true })
+          await status.refetch()
+        },
+      }),
       (library.isError || library.data?.error) && jsx('p', { role: 'alert', children: library.data?.error ?? 'Could not load model downloads and profiles.' }),
       library.data?.profiles && jsx(ModelProfiles, {
-        ctx, queryScope, library: library.data, revision: data?.ready ? data.revision : null,
+        ctx, queryScope, library: library.data, revision: data?.ready ? data.revision : null, busy: pending || !connected,
         onSave: () => queryClient.invalidateQueries({ queryKey: libraryKey, exact: true }),
       }, `profiles:${scopeKey}`),
       connected && data && jsx(ServingControls, { ctx, serving }, `serving:${scopeKey}`),
