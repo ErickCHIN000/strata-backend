@@ -7,9 +7,10 @@ import secrets
 import socket
 import subprocess
 import sys
+from threading import Thread
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from urllib.request import Request, urlopen
 
 import psutil
@@ -18,6 +19,8 @@ import psutil
 PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
 ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe"}
+PROVIDER_PROTOCOL = 2
+DESKTOP_LEASE_SECONDS = 65
 
 
 def read_json(path):
@@ -66,6 +69,51 @@ def model_roster(library):
     return roster
 
 
+def touch_desktop(root, payload):
+    client = (payload or {}).get("client")
+    if not isinstance(client, str) or not re.fullmatch(r"[a-f0-9-]{36}", client):
+        raise ValueError("Invalid Hermes Desktop window identity.")
+    model = payload.get("model")
+    if model is not None and (not isinstance(model, str) or len(model) > 512):
+        raise ValueError("Invalid Hermes model selection.")
+    directory = service_root(root) / "windows"
+    path = directory / f"{client}.json"
+    previous = read_json(path)
+    if model is None:
+        model = previous.get("model", "")
+    sequence = payload.get("sequence", 0)
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise ValueError("Invalid Hermes model selection order.")
+    if sequence and sequence <= previous.get("sequence", 0):
+        return
+    now = time()
+    order = now if payload.get("focus") or previous.get("model") != model or not previous.get("order") else previous["order"]
+    write_json(path, {"model": model, "seen": now, "order": order, "sequence": sequence, "closed": payload.get("closed") is True,
+                      "intent": secrets.token_hex(12) if previous.get("model") != model or not previous.get("intent")
+                      else previous["intent"]})
+
+
+def desktop_choice(root):
+    directory = service_root(root)
+    windows = [read_json(path) for path in (directory / "windows").glob("*.json")]
+    cutoff = time() - DESKTOP_LEASE_SECONDS
+    active = [window for window in windows if not window.get("closed") and window.get("seen", 0) >= cutoff]
+    if not active:
+        return None, bool(windows)
+    choice = max(active, key=lambda window: window.get("order", 0))
+    roster = read_json(directory / "models.json")
+    selected = roster.get(choice["model"])
+    held = read_json(directory / "hold.json")
+    if selected and held.get("intent") != choice.get("intent"):
+        return {**selected, "alias": choice["model"], "intent": choice["intent"]}, False
+    return None, False
+
+
+def hold_desktop_choice(root, intent):
+    if intent:
+        write_json(service_root(root) / "hold.json", {"intent": intent})
+
+
 def instance_file(directory, key):
     return directory / "instances" / f"{profile_id(key)}.json"
 
@@ -80,9 +128,12 @@ def process_for(record):
     return None
 
 
-def loopback_port():
+def loopback_port(preferred=0):
     with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
+        try:
+            listener.bind(("127.0.0.1", preferred))
+        except OSError:
+            listener.bind(("127.0.0.1", 0))
         return listener.getsockname()[1]
 
 
@@ -150,8 +201,12 @@ def configure_provider(root, roster):
     provider = read_json(file)
     process = None
     try:
+        old_process = process_for(provider)
+        if old_process is not None and provider.get("protocol") != PROVIDER_PROTOCOL:
+            stop_process_tree(old_process, managed=True)
         if process_for(provider) is None:
-            provider = {"port": loopback_port(), "key": provider.get("key") or secrets.token_urlsafe(32)}
+            provider = {"port": loopback_port(provider.get("port", 0)), "key": provider.get("key") or secrets.token_urlsafe(32),
+                        "protocol": PROVIDER_PROTOCOL}
             write_json(file, provider)
             write_json(directory / "models.json", roster)
             with (directory / "provider.log").open("ab") as log:
@@ -253,7 +308,7 @@ def prepare_config(root, profile, model, destination):
     write_json(destination, config)
 
 
-def start_profile(root, python, env, profile, model, alias, log):
+def start_profile(root, python, env, profile, model, alias, log, intent=None):
     directory = service_root(root)
     key = profile_id(profile["id"])
     record_path = instance_file(directory, key)
@@ -263,10 +318,32 @@ def start_profile(root, python, env, profile, model, alias, log):
     config_path = directory / "configs" / f"{key}.json"
     spec_path = directory / "configs" / f"{key}.prepare.json"
     write_json(spec_path, {"profile": profile, "model": model})
-    record = {"profile_id": key, "name": profile["name"], "model": alias, "phase": "preparing"}
+    def current():
+        if not intent:
+            return True
+        choice, _ = desktop_choice(root)
+        return bool(choice and choice["intent"] == intent and choice["alias"] == alias)
+
+    if not current():
+        return
+    record = {"profile_id": key, "name": profile["name"], "model": alias, "phase": "preparing",
+              "intent": intent}
     prepare = spawn([str(python), "-B", __file__, "prepare", str(root), str(spec_path), str(config_path)], source, env, log)
     write_json(record_path, {**record, **process_record(prepare)})
-    if prepare.wait():
+    result = None
+    while result is None:
+        if not current():
+            process = process_for(read_json(record_path))
+            if process:
+                stop_process_tree(process, managed=True)
+            return
+        try:
+            result = prepare.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            continue
+    if not current():
+        return
+    if result:
         raise ValueError("Strata could not prepare this profile. See the activity log.")
 
     config = read_json(config_path)
@@ -279,6 +356,8 @@ def start_profile(root, python, env, profile, model, alias, log):
     args = profile.get("server_args", [])
     reject_routing_args(args, {"--config", "--host", "--port", "--api-key", "--engine"})
     logfile = directory / "instances" / f"{key}.log"
+    if not current():
+        return
     with logfile.open("wb") as server_log:
         server = spawn([str(python), "-B", "-m", "serve.server", "--engine", "strata", "--config", str(config_path),
                         "--host", "127.0.0.1", "--port", str(port), *args], source, env, server_log)
@@ -347,8 +426,17 @@ def stop_instance(root, payload):
     process = process_for(row) if row else None
     if process is None:
         raise ValueError("That Strata process has already exited or changed identity.")
+    if row.get("profile_id"):
+        selection, _ = desktop_choice(root)
+        if selection and selection["profile_id"] == row["profile_id"]:
+            hold_desktop_choice(root, selection["intent"])
+    stop_process_tree(process, managed=row["managed"])
+    return {"ok": True}
+
+
+def stop_process_tree(process, *, managed):
     try:
-        children = process.children(recursive=True) if row["managed"] else []
+        children = process.children(recursive=True) if managed else []
         for candidate in (process, *reversed(children)):
             try:
                 candidate.terminate()
@@ -365,10 +453,24 @@ def stop_instance(root, payload):
             raise ValueError("A Strata process did not exit. Refresh the process list and try again.")
     except psutil.AccessDenied as exc:
         raise ValueError("The current Hermes account cannot stop that Strata process.") from exc
-    return {"ok": True}
+
+
+def stop_unselected(root, selected):
+    directory = service_root(root)
+    for file in (directory / "instances").glob("*.json"):
+        instance = read_json(file)
+        latest, _ = desktop_choice(root)
+        if latest != selected:
+            return
+        if latest and (instance.get("profile_id"), instance.get("model")) == (latest["profile_id"], latest["alias"]):
+            continue
+        process = process_for(instance)
+        if process:
+            stop_process_tree(process, managed=True)
 
 
 def serve_bridge(directory):
+    import asyncio
     import httpx
     import uvicorn
     from fastapi import FastAPI, HTTPException, Request as ApiRequest
@@ -401,9 +503,24 @@ def serve_bridge(directory):
         selected = read_json(directory / "models.json").get(alias)
         if not selected:
             raise HTTPException(404, "Unknown Strata profile. Refresh the Hermes model picker.")
-        instance = read_json(instance_file(directory, selected["profile_id"]))
-        if process_for(instance) is None or instance.get("model") != alias or not instance.get("port"):
-            raise HTTPException(503, "Start this profile in the Strata Backend tab before sending a message.")
+        deadline = monotonic() + 480
+        selection_grace = monotonic() + 4
+        root = directory.parent
+        while True:
+            instance = read_json(instance_file(directory, selected["profile_id"]))
+            choice, _ = desktop_choice(root)
+            tracked = (directory / "windows").is_dir()
+            matching = bool(choice and choice["alias"] == alias)
+            if (process_for(instance) and instance.get("model") == alias and instance.get("port")
+                    and (matching or not tracked) and await asyncio.to_thread(online, instance, "/health")):
+                break
+            if not matching and (not tracked or monotonic() >= selection_grace):
+                raise HTTPException(503, "Select a different model and reselect this Strata profile in Hermes Desktop to load it.")
+            if matching and instance.get("intent") == choice["intent"] and instance.get("pid") and not process_for(instance):
+                raise HTTPException(503, "Strata could not start this profile. Check the activity log in Strata Backend.")
+            if monotonic() >= deadline:
+                raise HTTPException(503, "Strata is still loading this profile. Check the activity log and retry.")
+            await asyncio.sleep(0.5)
         client = httpx.AsyncClient(timeout=httpx.Timeout(600, connect=5), trust_env=False)
         try:
             upstream = await client.send(client.build_request(
@@ -425,7 +542,26 @@ def serve_bridge(directory):
         return StreamingResponse(response(), status_code=upstream.status_code,
                                  media_type=upstream.headers.get("content-type", "application/json"))
 
-    uvicorn.run(app, host="127.0.0.1", port=int(provider["port"]), access_log=False)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=int(provider["port"]), access_log=False))
+
+    def watch_desktop():
+        root = directory.parent
+        started = monotonic()
+        while not server.should_exit:
+            try:
+                selected, closed = desktop_choice(root)
+                windows = directory / "windows"
+                if windows.is_dir() or monotonic() - started >= DESKTOP_LEASE_SECONDS:
+                    stop_unselected(root, selected)
+                    if closed or not windows.is_dir():
+                        server.should_exit = True
+                        return
+            except (OSError, ValueError, psutil.Error) as exc:
+                print(f"Could not reconcile Strata process lifetime: {exc}", flush=True)
+            sleep(1)
+
+    Thread(target=watch_desktop, daemon=True).start()
+    server.run()
 
 
 if __name__ == "__main__":

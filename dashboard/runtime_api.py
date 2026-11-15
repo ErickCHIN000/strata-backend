@@ -523,6 +523,49 @@ def setup_hermes_provider(_payload):
         return {"ok": False, "error": "Could not start or configure the local Strata provider."}
 
 
+def desktop_selection(payload):
+    from hermes_cli.plugins_auto_update import plugin_update_lock
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    try:
+        root = strata_directory()
+        if not (root / "prepared-commit").is_file():
+            return {"ok": True}
+        tools = serving_tools()
+        directory = tools["service_root"](root)
+        with strata_jobs_lock:
+            if strata_jobs.get(root) == "wipe":
+                return {"ok": True}
+            tools["touch_desktop"](root, payload)
+        if payload.get("closed") is True:
+            return {"ok": True}
+
+        provider = tools["read_json"](directory / "provider.json")
+        if provider.get("protocol") != tools["PROVIDER_PROTOCOL"] or not tools["process_for"](provider):
+            with plugin_update_lock(root):
+                roster = tools["model_roster"](model_library())
+                if not roster:
+                    return {"ok": True}
+                tools["configure_provider"](root, roster)
+
+        selected, _ = tools["desktop_choice"](root)
+        if selected:
+            instance = tools["read_json"](tools["instance_file"](directory, selected["profile_id"]))
+            if not tools["process_for"](instance) and instance.get("intent") != selected["intent"]:
+                with strata_jobs_lock:
+                    busy = root in strata_jobs
+                if not busy:
+                    return strata_action("serve", {"id": selected["profile_id"], "intent": selected["intent"]})
+        return {"ok": True}
+    except PluginOperationError:
+        # Setup or an engine operation holds this profile's lock. The next heartbeat retries.
+        return {"ok": True}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except (OSError, ImportError):
+        return {"ok": False, "error": "Could not follow Hermes Desktop model selection."}
+
+
 def sync_serving_profiles(root):
     if (root / "serving" / "provider.json").is_file():
         tools = serving_tools()
@@ -554,8 +597,14 @@ def launch_saved_profile(root, payload, log):
                   if item["profile_id"] == payload["id"]), None)
     if selected is None or alias is None:
         raise ValueError("Choose a saved profile linked to a downloaded model.")
+    intent = payload.get("intent")
+    if intent:
+        choice, _ = tools["desktop_choice"](root)
+        if not choice or choice["intent"] != intent or choice["alias"] != alias:
+            return
+        tools["stop_unselected"](root, choice)
     model = next(item for item in library["models"] if item["id"] == selected["model_id"])
-    tools["start_profile"](root, strata_python(root), managed_environment(root), selected, model, alias, log)
+    tools["start_profile"](root, strata_python(root), managed_environment(root), selected, model, alias, log, intent)
 
 
 PROFILE_OPTIONS = {
@@ -724,8 +773,12 @@ def change_strata(root: Path, operation: str, payload: dict | None) -> None:
             if root.exists():
                 if (root / "serving").is_dir():
                     tools = serving_tools()
-                    if any(row["managed"] and row["state"] != "exited" for row in tools["instance_rows"](root)):
-                        raise ValueError("Stop the managed Strata processes before wiping their files.")
+                    rows = tools["instance_rows"](root)
+                    if any(row["managed"] and not row.get("provider") and row["state"] != "exited" for row in rows):
+                        raise ValueError("Switch away from Strata or stop the selected profile before wiping its files.")
+                    for row in rows:
+                        if row.get("provider"):
+                            tools["stop_instance"](root, row)
                     tools["sync_provider"](root, {})
                 rmtree_readonly(root)
             return
@@ -770,6 +823,8 @@ def change_strata(root: Path, operation: str, payload: dict | None) -> None:
         message = str(exc) if isinstance(exc, ValueError) else "Could not complete the Strata operation."
         if root.is_dir() and root.resolve() == root:
             (root / "setup-error.txt").write_text(message, encoding="utf-8")
+            if operation == "serve" and payload and payload.get("intent"):
+                serving_tools()["hold_desktop_choice"](root, payload["intent"])
             if operation == "download" and write_transfer:
                 write_transfer(root, {**(read_transfer(root) or {}), "selection": payload, "phase": "failed"})
 
@@ -804,4 +859,4 @@ POST_HANDLERS = {action: partial(strata_action, action) for action in ("setup", 
 POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile,
                       "pause-download": pause_download, "resume-download": resume_download,
                       "setup-provider": setup_hermes_provider, "start-profile": start_serving_profile,
-                      "stop-instance": stop_serving_instance})
+                      "stop-instance": stop_serving_instance, "desktop-selection": desktop_selection})

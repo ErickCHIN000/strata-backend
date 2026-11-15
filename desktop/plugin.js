@@ -416,7 +416,7 @@ function DownloadProgress({ transfer, active, busy, pausing, onPause, onResume }
   })
 }
 
-function ServingControls({ ctx, queryScope, busy, onStart }) {
+function ServingControls({ ctx, queryScope }) {
   const serving = useQuery({
     queryKey: [...queryScope, 'strata-serving'], queryFn: () => ctx.rest('/runtime/serving'),
     refetchInterval: 3000, retry: false,
@@ -424,8 +424,7 @@ function ServingControls({ ctx, queryScope, busy, onStart }) {
   const [requesting, setRequesting] = useState(false)
   const [confirmStop, setConfirmStop] = useState(null)
   const state = serving.data
-  const rows = state?.instances ?? []
-  const profiles = state?.models ?? []
+  const rows = (state?.instances ?? []).filter(row => !row.provider)
 
   async function request(operation, body) {
     if (requesting) return
@@ -434,7 +433,6 @@ function ServingControls({ ctx, queryScope, busy, onStart }) {
     try {
       const result = await ctx.rest(`/runtime/${operation}`, { method: 'POST', body, timeoutMs: 18_000 })
       if (!result.ok) throw new Error(result.error || 'The operation failed.')
-      if (operation === 'setup-provider') host.notify({ kind: 'success', message: 'Strata Backend is available in the Hermes model picker.' })
       await serving.refetch()
     } catch (error) {
       host.notifyError(error, 'Could not manage the Strata provider')
@@ -448,29 +446,8 @@ function ServingControls({ ctx, queryScope, busy, onStart }) {
     children: [
       jsx('h2', { className: 'font-medium', children: 'Hermes provider' }),
       jsx('p', { className: 'text-(--ui-text-secondary)', children: state?.provider_ready
-        ? 'Strata Backend is available in the Hermes model picker. Start a profile before using it.'
-        : 'Set up the local provider to list your downloaded model profiles in the Hermes model picker.' }),
-      jsx('div', { children: jsx('button', {
-        type: 'button', className: buttonClass, disabled: busy || requesting || !profiles.length,
-        onClick: () => void request('setup-provider'), children: state?.provider_ready ? 'Refresh Hermes provider' : 'Set up Hermes provider',
-      }) }),
-      profiles.length > 0 && jsx('ul', {
-        className: 'divide-y divide-(--ui-stroke-secondary)',
-        children: profiles.map(profile => {
-          const running = rows.some(row => row.profile_id === profile.profile_id && row.state !== 'exited')
-          return jsxs('li', {
-            className: 'flex flex-wrap items-center justify-between gap-2 py-2',
-            children: [
-              jsxs('div', { children: [jsx('div', { children: profile.name }),
-                jsx('div', { className: 'text-(--ui-text-secondary)', children: `${profile.model_title} · Picker ID ${profile.id}` })] }),
-              jsx('button', {
-                type: 'button', className: buttonClass, disabled: busy || requesting || running,
-                onClick: () => onStart(profile.profile_id), children: running ? 'Running' : 'Start profile',
-              }),
-            ],
-          }, profile.profile_id)
-        }),
-      }),
+        ? 'Select a saved Strata profile in the Hermes model picker to load it. Selecting another provider unloads Strata.'
+        : state?.models?.length ? 'Registering the Strata provider with Hermes…' : 'Save a profile linked to a downloaded model to make it available in the picker.' }),
       jsx('h3', { className: 'font-medium', children: 'Strata processes' }),
       !rows.length && jsx('p', { className: 'text-(--ui-text-secondary)', children: 'No Strata processes detected.' }),
       rows.length > 0 && jsx('ul', {
@@ -736,8 +713,7 @@ function StrataPage({ ctx }) {
         ctx, queryScope, library: library.data, revision: data?.ready ? data.revision : null,
         onSave: () => queryClient.invalidateQueries({ queryKey: libraryKey, exact: true }),
       }, `profiles:${scopeKey}`),
-      connected && data && jsx(ServingControls, { ctx, queryScope, busy: pending,
-        onStart: id => void run('start-profile', { id }) }, `serving:${scopeKey}`),
+      connected && data && jsx(ServingControls, { ctx, queryScope }, `serving:${scopeKey}`),
     ],
   })
 }
@@ -810,10 +786,92 @@ function VersionPill({ ctx }) {
   })
 }
 
+function followDesktopModel(ctx) {
+  if (!window.hermesDesktop) return
+  const windowKey = Symbol.for('strata-backend:desktop-window')
+  const client = window[windowKey] ?? (window[windowKey] = crypto.randomUUID())
+  let sequence = Date.now() * 1000
+  let sending = false
+  let queued = false
+  let claimFocus = document.hasFocus()
+  let closed = false
+  let lastModel = ''
+  let reportedError = ''
+  const sessionModels = new Map()
+
+  function send(model, focus, exiting = false) {
+    sequence = Math.max(sequence + 1, Date.now() * 1000)
+    return ctx.rest('/runtime/desktop-selection', {
+      method: 'POST', body: { client, sequence, model, focus, closed: exiting }, timeoutMs: 16_000,
+    })
+  }
+
+  async function refresh() {
+    if (closed || host.state.gateway.get() !== 'open') return
+    if (sending) { queued = true; return }
+    sending = true
+    try {
+      const sid = host.state.focusedSessionId.get()
+      const connection = host.state.connectionId.get()
+      const profile = host.state.profile.get()
+      let model = host.state.model.get()
+      if (sid && sid !== host.state.activeSessionId.get()) {
+        const owner = host.state.focusedSessionOwner.get()
+        if (owner && (owner.connectionId !== (connection ?? 'local') || owner.profile !== profile)) return
+        model = sessionModels.get(sid)
+        if (model == null) {
+          const info = await host.request('session.info', { session_id: sid })
+          if (closed || sid !== host.state.focusedSessionId.get() || connection !== host.state.connectionId.get() || profile !== host.state.profile.get()) return
+          model = typeof info?.model === 'string' ? info.model : ''
+          sessionModels.set(sid, model)
+        }
+      }
+      const focus = claimFocus
+      claimFocus = false
+      if (model) lastModel = model
+      const result = await send(model || null, focus)
+      if (result?.error && result.error !== reportedError && !result.error.includes('already running')) {
+        reportedError = result.error
+        host.notifyError(new Error(result.error), 'Could not update the Strata model selection')
+      } else if (result?.ok) {
+        reportedError = ''
+      }
+    } catch {
+      // Gateway reconnection and the periodic heartbeat retry this selection.
+    } finally {
+      sending = false
+      if (queued && !closed) {
+        queued = false
+        void refresh()
+      }
+    }
+  }
+
+  const refreshSoon = () => void refresh()
+  for (const state of [host.state.model, host.state.gateway, host.state.profile, host.state.connectionId, host.state.focusedSessionId]) {
+    ctx.onDispose(state.listen(refreshSoon))
+  }
+  ctx.onEvent('session.info', event => {
+    if (event.session_id && typeof event.payload?.model === 'string') {
+      sessionModels.set(event.session_id, event.payload.model)
+      if (event.session_id === host.state.focusedSessionId.get()) refreshSoon()
+    }
+  })
+  ctx.addEventListener(window, 'focus', () => { claimFocus = true; refreshSoon() })
+  ctx.addEventListener(window, 'pagehide', () => {
+    closed = true
+    if (host.state.gateway.get() === 'open') void send(lastModel, false, true).catch(() => undefined)
+  })
+  ctx.onDispose(() => { closed = true })
+  ctx.setInterval(refreshSoon, 4000)
+  refreshSoon()
+}
+
 export default {
   id: 'strata-backend',
   name: title,
   register(ctx) {
+    followDesktopModel(ctx)
     ctx.register({
       id: 'page',
       area: ROUTES_AREA,

@@ -29,11 +29,11 @@ The DavidAU Flash-Next shortcut points to two raw `IQ3_S` shards and a separate 
 
 ## Use a profile in Hermes
 
-1. Save a profile linked to a downloaded model, then click **Set up Hermes provider** in the Strata tab. This adds **Strata Backend** to the current Hermes profile's model picker with one model ID per eligible saved profile.
-2. Click **Start profile**. Strata prepares the pack from the downloaded GGUFs and starts a local server using the profile. For the baseline, vision and the optional draft download are off. On Windows, Strata uses resident low-RAM mode when available commit is smaller than the expert arena unless the profile specifies a low-RAM mode.
-3. Once the process reports **ready**, choose the profile in the Hermes model picker. Use **Refresh models** in the picker if the new provider has not appeared yet.
+1. Save a profile linked to a downloaded model. Strata Backend registers eligible profiles in the current Hermes model picker automatically.
+2. Select the profile in the model picker. Strata prepares its pack from the downloaded GGUFs and starts the local server. The first prompt waits for that launch. For the baseline, vision and the optional draft download are off. On Windows, Strata uses resident low-RAM mode when available commit is smaller than the expert arena unless the profile specifies a low-RAM mode.
+3. Selecting another Strata profile unloads the previous one. Choosing a cloud model unloads the model and keeps the lightweight provider available for later selection. Closing the final Desktop window releases both. If the close signal is interrupted, the backend cleans up after the last heartbeat expires.
 
-**Strata processes** lists managed instances and detected external Strata engines or servers. Stop only the process you select. Profile edits take effect the next time the instance starts. Managed source serving currently supports GGUF weights that Strata’s own-files setup recognizes. Separate-engine and ready-pack formats need their own serving setup.
+**Strata processes** lists managed instances and detected external Strata engines or servers. **Stop process** unloads the selected managed model until you choose a different model and select it again. Automatic unloading applies to plugin-managed instances. Profile edits take effect the next time the instance starts. Managed source serving currently supports GGUF weights that Strata’s own-files setup recognizes. Separate-engine and ready-pack formats need their own serving setup.
 
 On upgrading from v0.2.2 or earlier, use the **Restart gateway** button in the Strata tab to activate the new Python router once. Updates to the plugin's runtime handlers are then picked up on the next request through that router.
 
