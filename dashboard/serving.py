@@ -19,7 +19,7 @@ import psutil
 PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
 ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe"}
-PROVIDER_PROTOCOL = 4
+PROVIDER_PROTOCOL = 5
 DESKTOP_LEASE_SECONDS = 65
 
 
@@ -95,7 +95,7 @@ def touch_desktop(root, payload):
                       "intent": previous["intent"] if same_model and previous.get("intent") else secrets.token_hex(12)})
 
 
-def desktop_choice(root, *, include_dormant=False):
+def desktop_choice(root, *, include_dormant=False, request_alias=None, requested_at=0):
     directory = service_root(root)
     windows = [read_json(path) for path in (directory / "windows").glob("*.json")]
     cutoff = time() - DESKTOP_LEASE_SECONDS
@@ -104,18 +104,41 @@ def desktop_choice(root, *, include_dormant=False):
         return None, bool(windows)
     choice = max(active, key=lambda window: window.get("order", 0))
     roster = read_json(directory / "models.json")
-    selected = roster.get(choice["model"])
+    alias = choice["model"]
+    selected = roster.get(alias)
+    if not selected:
+        return None, False
+    selection = choice["intent"]
     held = read_json(directory / "hold.json")
     demand = read_json(directory / "demand.json")
-    loading = choice.get("load", True) or demand.get("intent") == choice.get("intent")
-    if selected and (loading or include_dormant) and held.get("intent") != choice.get("intent"):
-        return {**selected, "alias": choice["model"], "intent": choice["intent"]}, False
+    intent = demand.get("intent", selection) if demand.get("selection") == selection else selection
+    if held.get("intent") == intent:
+        if request_alias != alias or requested_at <= held.get("stopped_at", 0):
+            return None, False
+        restart = held.get("restart")
+        if restart is None and "stopped_at" not in held and not (root / "setup-error.txt").is_file():
+            # Older plugin versions stored only the held intent for manual stops.
+            restart = f"{intent}-resumed"
+        if not restart:
+            return None, False
+        intent = restart
+        demand = {"selection": selection, "intent": intent}
+        write_json(directory / "demand.json", demand)
+    loading = choice.get("load", True) or demand.get("intent") == intent
+    if not loading and request_alias == alias:
+        write_json(directory / "demand.json", {"intent": intent})
+        loading = True
+    if loading or include_dormant:
+        return {**selected, "alias": alias, "intent": intent, "restarted": intent != selection}, False
     return None, False
 
 
-def hold_desktop_choice(root, intent):
+def hold_desktop_choice(root, intent, *, manual_stop=False):
     if intent:
-        write_json(service_root(root) / "hold.json", {"intent": intent})
+        hold = {"intent": intent, "restart": None, "stopped_at": time()}
+        if manual_stop:
+            hold["restart"] = secrets.token_hex(12)
+        write_json(service_root(root) / "hold.json", hold)
 
 
 def instance_file(directory, key):
@@ -456,7 +479,7 @@ def stop_instance(root, payload):
     if row.get("profile_id"):
         selection, _ = desktop_choice(root, include_dormant=True)
         if selection and selection["profile_id"] == row["profile_id"]:
-            hold_desktop_choice(root, selection["intent"])
+            hold_desktop_choice(root, selection["intent"], manual_stop=True)
     stop_process_tree(process, managed=row["managed"])
     return {"ok": True}
 
@@ -533,25 +556,22 @@ def serve_bridge(directory):
         deadline = monotonic() + 480
         # Session confirmation and the desktop heartbeat can arrive after the first prompt.
         selection_grace = monotonic() + DESKTOP_LEASE_SECONDS
+        requested_at = time()
         selected_intent = None
         root = directory.parent
         while True:
             instance = read_json(instance_file(directory, selected["profile_id"]))
-            choice, _ = desktop_choice(root)
             tracked = (directory / "windows").is_dir()
-            if choice is None and tracked:
-                dormant, _ = desktop_choice(root, include_dormant=True)
-                if dormant and dormant["alias"] == alias:
-                    # A request to the restored profile is explicit use. Idle startup stays cold.
-                    write_json(directory / "demand.json", {"intent": dormant["intent"]})
-                    choice, _ = desktop_choice(root)
+            choice, _ = desktop_choice(root, request_alias=alias if selected_intent is None else None,
+                                       requested_at=requested_at)
             matching = bool(choice and choice["alias"] == alias)
             if matching and selected_intent is None:
                 selected_intent = choice["intent"]
             if selected_intent and (not matching or choice["intent"] != selected_intent):
                 raise HTTPException(409, "The Strata profile was deselected or stopped in Hermes Desktop.")
             process = process_for(instance)
-            same_instance = instance.get("model") == alias and (matching or not tracked)
+            same_instance = instance.get("model") == alias and (not tracked or (
+                matching and (not choice.get("restarted") or instance.get("intent") == choice["intent"])))
             if process and same_instance and instance.get("port") and await asyncio.to_thread(online, instance, "/health"):
                 break
             if not matching and monotonic() >= selection_grace:
