@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import runpy
+import shutil
 import subprocess
 import sys
 from contextvars import copy_context
@@ -11,6 +13,7 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from plugins.plugin_storage import plugin_data_dir
 from ruamel.yaml import YAML, YAMLError
@@ -18,6 +21,7 @@ from ruamel.yaml import YAML, YAMLError
 
 PLUGIN_ID = "strata-backend"
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
+MODEL_HELPER = Path(__file__).with_name("model_download.py")
 STRATA_REPO = "Niko1221/Strata"
 STRATA_ORIGIN = f"https://github.com/{STRATA_REPO}.git"
 STRATA_BRANCH = "main"
@@ -340,6 +344,207 @@ def strata_models():
         return {"error": "Strata could not read its hardware and model catalog."}
 
 
+def hf_environment(root):
+    env = managed_environment(root)
+    env["HF_ENDPOINT"] = "https://huggingface.co"
+    # The Hub client resolves the existing login and download cache itself.
+    if "HF_HOME" in os.environ:
+        env["HF_HOME"] = os.environ["HF_HOME"]
+    else:
+        env.pop("HF_HOME", None)
+    env.setdefault("HF_XET_CACHE", str(root / "hf-xet"))
+    return env
+
+
+def ensure_hf(root, env, log=None):
+    python = str(strata_python(root))
+    options = {"env": env, "cwd": root, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    probe = subprocess.run(
+        [python, "-B", "-c", "from huggingface_hub import HfApi, hf_hub_download, get_token, try_to_load_from_cache"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, **options,
+    )
+    if probe.returncode:
+        if log is not None:
+            log.write(b"Installing the Hugging Face client in the managed venv.\n")
+        subprocess.run(
+            [python, "-m", "pip", "--disable-pip-version-check", "--no-input", "install", "huggingface-hub>=1,<2"],
+            stdout=log if log is not None else subprocess.DEVNULL, stderr=subprocess.STDOUT,
+            timeout=100, check=True, **options,
+        )
+    return python
+
+
+def hf_files(payload):
+    from hermes_cli.plugins_auto_update import plugin_update_lock
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    try:
+        payload = payload or {}
+        repo = runpy.run_path(str(MODEL_HELPER))["validate_repo"](payload.get("repo"))
+        filename = payload.get("filename") or ""
+        if not isinstance(filename, str) or len(filename) > 750:
+            raise ValueError("Enter a GGUF filename or quantization.")
+        root = strata_directory()
+        if not strata_python(root).is_file():
+            raise ValueError("Set up Strata’s venv first.")
+        with plugin_update_lock(root):
+            env = hf_environment(root)
+            python = ensure_hf(root, env)
+            result = subprocess.run(
+                [python, "-B", str(MODEL_HELPER), "files", str(root)], cwd=root,
+                input=json.dumps({"repo": repo, "filename": filename.strip()}),
+                capture_output=True, encoding="utf-8", env=env, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        if result.returncode:
+            error = result.stderr.strip()
+            raise ValueError(error if error.startswith("Hugging Face") or error.startswith("Could not read")
+                             else "Could not read Hugging Face files.")
+        return {**json.loads(result.stdout), "existing_cli": bool(shutil.which("hf"))}
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except PluginOperationError:
+        return {"error": "Wait for the current Strata operation to finish."}
+    except (OSError, subprocess.SubprocessError):
+        return {"error": "The Hugging Face client could not be prepared or the Hub did not respond."}
+
+
+def downloaded_models(root):
+    records = []
+    for marker in (root / "models").glob("*/model.json"):
+        try:
+            record = json.loads(marker.read_text(encoding="utf-8"))
+            if (marker.parent.resolve() == marker.parent and isinstance(record, dict)
+                    and isinstance(record.get("title"), str) and isinstance(record.get("id"), str)
+                    and isinstance(record.get("files"), list) and record["files"]
+                    and all((marker.parent / name).is_file() for name in record["files"])):
+                records.append(record)
+        except (OSError, ValueError, TypeError):
+            continue
+    return sorted(records, key=lambda record: record["title"].casefold())
+
+
+def profile_directory(root):
+    directory = root.parent / "model-profiles"
+    if directory.resolve() != directory:
+        raise ValueError("The model profiles folder moved outside the plugin’s data directory.")
+    return directory
+
+
+def model_library():
+    try:
+        root = strata_directory()
+        directory = profile_directory(root)
+        profiles = []
+        for file in directory.glob("*.json"):
+            try:
+                profile = json.loads(file.read_text(encoding="utf-8"))
+                if isinstance(profile, dict) and profile.get("id") == file.stem and isinstance(profile.get("name"), str):
+                    profiles.append(profile)
+            except (OSError, ValueError):
+                continue
+        return {"models": downloaded_models(root), "profiles": sorted(profiles, key=lambda p: p["name"].casefold())}
+    except (OSError, ValueError):
+        return {"error": "Could not read managed models and profiles."}
+
+
+PROFILE_OPTIONS = {
+    "--max-context": (int, 1),
+    "--memory-limit-mib": (int, 0),
+    "--resident-budget-gib": (float, 0.001),
+    "--vram-reserve-mib": (int, 0),
+}
+
+
+def profile_arguments(value):
+    if not isinstance(value, list) or any(not isinstance(arg, str) or "\x00" in arg for arg in value):
+        raise ValueError("Arguments must be a JSON array of strings, one element per argument.")
+    return value
+
+
+def save_model_profile(payload):
+    try:
+        import math
+
+        payload = payload or {}
+        profile_id = payload.get("id") or uuid4().hex
+        name, selected_model = payload.get("name"), payload.get("model_id")
+        if not isinstance(profile_id, str) or not re.fullmatch(r"[a-f0-9]{32}", profile_id):
+            raise ValueError("Invalid model profile ID.")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 120:
+            raise ValueError("Enter a profile name up to 120 characters.")
+        if selected_model is not None and (not isinstance(selected_model, str) or len(selected_model) > 1200):
+            raise ValueError("Invalid model selection.")
+        controls = payload.get("controls") or {}
+        if not isinstance(controls, dict) or any(flag not in PROFILE_OPTIONS for flag in controls):
+            raise ValueError("Invalid resource option.")
+        user_args = []
+        for flag, value in controls.items():
+            kind, minimum = PROFILE_OPTIONS[flag]
+            if value in (None, ""):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                raise ValueError(f"Invalid value for {flag}.")
+            parsed = kind(value) if not isinstance(value, float) or kind is float else math.nan
+            if not math.isfinite(parsed) or parsed < minimum:
+                raise ValueError(f"Invalid value for {flag}.")
+            user_args.extend((flag, str(parsed)))
+        arguments = {key: profile_arguments(payload.get(key, []))
+                     for key in ("engine_args", "launch_args", "setup_args", "server_args")}
+        env, config = payload.get("env", {}), payload.get("config", {})
+        if (not isinstance(env, dict) or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                                              or not isinstance(value, str) or "\x00" in value for key, value in env.items())
+                or not isinstance(config, dict)):
+            raise ValueError("Environment and config must be JSON objects. Environment values must be strings.")
+        profile = {"id": profile_id, "name": name.strip(), "model_id": selected_model, "controls": controls,
+                   **arguments, "user_args": user_args + arguments["engine_args"], "env": env, "config": config}
+        content = json.dumps(profile, indent=2, allow_nan=False)
+        if len(content) > 256_000:
+            raise ValueError("This model profile is too large.")
+        directory = profile_directory(strata_directory())
+        directory.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=directory) as temp:
+            staged = Path(temp) / "profile.json"
+            staged.write_text(content, encoding="utf-8")
+            os.replace(staged, directory / f"{profile_id}.json")
+        return {"ok": True, "profile": profile}
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except OSError:
+        return {"ok": False, "error": "Could not save the model profile."}
+
+
+def model_option_reference():
+    try:
+        root = strata_directory()
+        source = root / "source"
+        python = str(strata_python(root))
+        engine = next((source / name / ("strata.exe" if os.name == "nt" else "strata")
+                       for name in ("engine", "engine-cuda12")
+                       if (source / name / ("strata.exe" if os.name == "nt" else "strata")).is_file()), None)
+        commands = {"Engine": [str(engine), "--help"] if engine else None,
+                    "Setup": [python, "-B", "setup.py", "--help"],
+                    "Launch": [python, "-B", "strata.py", "launch", "--help"],
+                    "Server": [python, "-B", "-m", "serve.server", "--help"]}
+        reference = {}
+        for title, command in commands.items():
+            if command:
+                result = subprocess.run(command, cwd=source, env=managed_environment(root), capture_output=True,
+                                        encoding="utf-8", errors="replace", timeout=12,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                output = (result.stdout or result.stderr).strip()
+                if output and (result.returncode == 0 or output.startswith("strata generate ")):
+                    reference[title] = output
+        registry = json.loads((source / "data" / "settings-register.json").read_text(encoding="utf-8"))
+        reference["Environment"] = "\n".join(
+            " · ".join((item["name"], str(item.get("status") or ""), ", ".join(item.get("backends", [])))).rstrip(" ·")
+            for item in registry["settings"] if item.get("name")
+        )
+        return {"sections": reference}
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return {"error": "Could not read this Strata build’s option reference."}
+
+
 def prepare_strata(root: Path, operation: str, log) -> None:
     revision = strata_head(root)
     source = root / "source"
@@ -378,14 +583,14 @@ def prepare_strata(root: Path, operation: str, log) -> None:
     prepared.write_text(git_at(source, "rev-parse", "HEAD"), encoding="ascii")
 
 
-def run_strata_job(root: Path, operation: str) -> None:
+def run_strata_job(root: Path, operation: str, payload: dict | None) -> None:
     try:
         from hermes_cli.plugins_auto_update import plugin_update_lock
         from hermes_cli.plugins_cmd import PluginOperationError
 
         try:
             with plugin_update_lock(root):
-                change_strata(root, operation)
+                change_strata(root, operation, payload)
         except PluginOperationError:
             # Another Hermes process already owns the managed directory.
             return
@@ -394,7 +599,7 @@ def run_strata_job(root: Path, operation: str) -> None:
             strata_jobs.pop(root, None)
 
 
-def change_strata(root: Path, operation: str) -> None:
+def change_strata(root: Path, operation: str, payload: dict | None) -> None:
     try:
         if root != strata_directory():
             raise ValueError("The managed Strata folder changed before the operation.")
@@ -408,23 +613,40 @@ def change_strata(root: Path, operation: str) -> None:
         root.mkdir(parents=True, exist_ok=True)
         (root / "setup-error.txt").unlink(missing_ok=True)
         with (root / "setup.log").open("wb", buffering=0) as log:
-            log.write(b"Preparing the managed Strata checkout and Python environment.\n")
             try:
-                prepare_strata(root, operation, log)
+                if operation == "download":
+                    log.write(b"Preparing the model download.\n")
+                    env = hf_environment(root)
+                    python = ensure_hf(root, env, log)
+                    subprocess.run(
+                        [python, "-B", str(MODEL_HELPER), "download", str(root)], cwd=root,
+                        input=json.dumps(payload), stdout=log, stderr=subprocess.STDOUT, env=env,
+                        encoding="utf-8", check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                else:
+                    log.write(b"Preparing the managed Strata checkout and Python environment.\n")
+                    prepare_strata(root, operation, log)
             except subprocess.CalledProcessError as exc:
                 if exc.stderr:
                     log.write(exc.stderr.encode("utf-8", errors="replace"))
-                raise ValueError("Strata setup failed. See the setup log for details.") from exc
+                message = "Model download failed." if operation == "download" else "Strata setup failed."
+                raise ValueError(f"{message} See the activity log for details.") from exc
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         message = str(exc) if isinstance(exc, ValueError) else "Could not complete the Strata operation."
         if root.is_dir() and root.resolve() == root:
             (root / "setup-error.txt").write_text(message, encoding="utf-8")
 
 
-def strata_action(operation: str, _payload: dict | None = None):
+def strata_action(operation: str, payload: dict | None = None):
     try:
         root = strata_directory()
-    except (OSError, ValueError):
+        if operation == "download":
+            if not strata_python(root).is_file() or not strata_head(root):
+                raise ValueError("Set up the Strata runtime before downloading a model.")
+            payload = runpy.run_path(str(MODEL_HELPER))["model_selection"](payload)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except (OSError, subprocess.SubprocessError):
         return {"ok": False, "error": "Could not access the managed Strata folder."}
     with strata_jobs_lock:
         if root in strata_jobs:
@@ -432,12 +654,14 @@ def strata_action(operation: str, _payload: dict | None = None):
         strata_jobs[root] = operation
         context = copy_context()
         try:
-            Thread(target=context.run, args=(run_strata_job, root, operation), daemon=True).start()
+            Thread(target=context.run, args=(run_strata_job, root, operation, payload), daemon=True).start()
         except RuntimeError:
             strata_jobs.pop(root, None)
             return {"ok": False, "error": "Could not start the Strata operation."}
     return {"ok": True, "operation": operation}
 
 
-GET_HANDLERS = {"status": strata_status, "latest": strata_latest, "models": strata_models}
-POST_HANDLERS = {action: partial(strata_action, action) for action in ("setup", "update", "wipe")}
+GET_HANDLERS = {"status": strata_status, "latest": strata_latest, "models": strata_models,
+                "library": model_library, "model-options": model_option_reference}
+POST_HANDLERS = {action: partial(strata_action, action) for action in ("setup", "update", "wipe", "download")}
+POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile})
