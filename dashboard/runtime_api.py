@@ -22,6 +22,7 @@ from ruamel.yaml import YAML, YAMLError
 PLUGIN_ID = "strata-backend"
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 MODEL_HELPER = Path(__file__).with_name("model_download.py")
+SERVING_HELPER = Path(__file__).with_name("serving.py")
 STRATA_REPO = "Niko1221/Strata"
 STRATA_ORIGIN = f"https://github.com/{STRATA_REPO}.git"
 STRATA_BRANCH = "main"
@@ -488,6 +489,75 @@ def model_library():
         return {"error": "Could not read managed models and profiles."}
 
 
+def serving_tools():
+    return runpy.run_path(str(SERVING_HELPER))
+
+
+def serving_status():
+    try:
+        root = strata_directory()
+        tools = serving_tools()
+        roster = tools["model_roster"](model_library())
+        directory = tools["service_root"](root)
+        provider = tools["read_json"](directory / "provider.json")
+        instances = tools["instance_rows"](root)
+        return {"models": [{"id": alias, **item} for alias, item in roster.items()],
+                "provider_ready": any(row.get("provider") and row["state"] == "ready" for row in instances) and bool(provider.get("key")),
+                "instances": instances}
+    except (OSError, ValueError, ImportError):
+        return {"error": "Could not read the Strata provider and process status."}
+
+
+def setup_hermes_provider(_payload):
+    from hermes_cli.plugins_auto_update import plugin_update_lock
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    try:
+        root = strata_directory()
+        with plugin_update_lock(root):
+            tools = serving_tools()
+            return tools["configure_provider"](root, tools["model_roster"](model_library()))
+    except (ValueError, PluginOperationError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except (OSError, ImportError):
+        return {"ok": False, "error": "Could not start or configure the local Strata provider."}
+
+
+def sync_serving_profiles(root):
+    if (root / "serving" / "provider.json").is_file():
+        tools = serving_tools()
+        tools["sync_provider"](root, tools["model_roster"](model_library()))
+
+
+def start_serving_profile(payload):
+    try:
+        selected_id = serving_tools()["profile_id"]((payload or {}).get("id"))
+        return strata_action("serve", {"id": selected_id})
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def stop_serving_instance(payload):
+    try:
+        return serving_tools()["stop_instance"](strata_directory(), payload)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except (OSError, ImportError):
+        return {"ok": False, "error": "Could not stop the selected Strata instance."}
+
+
+def launch_saved_profile(root, payload, log):
+    library = model_library()
+    selected = next((p for p in library.get("profiles", []) if p["id"] == payload["id"]), None)
+    tools = serving_tools()
+    alias = next((name for name, item in tools["model_roster"](library).items()
+                  if item["profile_id"] == payload["id"]), None)
+    if selected is None or alias is None:
+        raise ValueError("Choose a saved profile linked to a downloaded model.")
+    model = next(item for item in library["models"] if item["id"] == selected["model_id"])
+    tools["start_profile"](root, strata_python(root), managed_environment(root), selected, model, alias, log)
+
+
 PROFILE_OPTIONS = {
     "--max-context": (int, 1),
     "--memory-limit-mib": (int, 0),
@@ -547,6 +617,10 @@ def save_model_profile(payload):
             staged = Path(temp) / "profile.json"
             staged.write_text(content, encoding="utf-8")
             os.replace(staged, directory / f"{profile_id}.json")
+        try:
+            sync_serving_profiles(strata_directory())
+        except (ValueError, OSError, ImportError):
+            return {"ok": True, "profile": profile, "warning": "Profile saved. Refresh the Strata provider to update the model picker."}
         return {"ok": True, "profile": profile}
     except (TypeError, ValueError, OverflowError) as exc:
         return {"ok": False, "error": str(exc)}
@@ -648,6 +722,11 @@ def change_strata(root: Path, operation: str, payload: dict | None) -> None:
             from utils import rmtree_readonly
 
             if root.exists():
+                if (root / "serving").is_dir():
+                    tools = serving_tools()
+                    if any(row["managed"] and row["state"] != "exited" for row in tools["instance_rows"](root)):
+                        raise ValueError("Stop the managed Strata processes before wiping their files.")
+                    tools["sync_provider"](root, {})
                 rmtree_readonly(root)
             return
 
@@ -671,6 +750,14 @@ def change_strata(root: Path, operation: str, payload: dict | None) -> None:
                         input=json.dumps(payload), stdout=log, stderr=subprocess.STDOUT, env=env,
                         encoding="utf-8", check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
+                    if (read_transfer(root) or {}).get("phase") == "complete":
+                        try:
+                            sync_serving_profiles(root)
+                        except (ValueError, OSError, ImportError):
+                            log.write(b"Download complete. Refresh the Strata provider to update the model picker.\n")
+                elif operation == "serve":
+                    log.write(b"Preparing the saved model profile from local files.\n")
+                    launch_saved_profile(root, payload, log)
                 else:
                     log.write(b"Preparing the managed Strata checkout and Python environment.\n")
                     prepare_strata(root, operation, log)
@@ -712,7 +799,9 @@ def strata_action(operation: str, payload: dict | None = None):
 
 
 GET_HANDLERS = {"status": strata_status, "latest": strata_latest, "models": strata_models,
-                "library": model_library, "model-options": model_option_reference}
+                "library": model_library, "model-options": model_option_reference, "serving": serving_status}
 POST_HANDLERS = {action: partial(strata_action, action) for action in ("setup", "update", "wipe", "download")}
 POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile,
-                      "pause-download": pause_download, "resume-download": resume_download})
+                      "pause-download": pause_download, "resume-download": resume_download,
+                      "setup-provider": setup_hermes_provider, "start-profile": start_serving_profile,
+                      "stop-instance": stop_serving_instance})

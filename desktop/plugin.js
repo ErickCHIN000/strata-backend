@@ -312,7 +312,7 @@ function ModelProfiles({ ctx, queryScope, library, revision, onSave }) {
       })
       if (!result.ok) throw new Error(result.error || 'Could not save the profile.')
       setDraft(profileDraft(result.profile))
-      setFeedback({ message: 'Profile saved.' })
+      setFeedback({ message: result.warning ?? 'Profile saved.' })
       await onSave()
     } catch (failure) {
       setFeedback({ error: true, message: failure instanceof SyntaxError ? 'Fix the JSON in the advanced settings.' : failure?.message })
@@ -412,6 +412,92 @@ function DownloadProgress({ transfer, active, busy, pausing, onPause, onResume }
       resume && jsx('div', {
         children: jsx('button', { type: 'button', className: buttonClass, disabled: busy, onClick: onResume, children: 'Resume download' }),
       }),
+    ],
+  })
+}
+
+function ServingControls({ ctx, queryScope, busy, onStart }) {
+  const serving = useQuery({
+    queryKey: [...queryScope, 'strata-serving'], queryFn: () => ctx.rest('/runtime/serving'),
+    refetchInterval: 3000, retry: false,
+  })
+  const [requesting, setRequesting] = useState(false)
+  const [confirmStop, setConfirmStop] = useState(null)
+  const state = serving.data
+  const rows = state?.instances ?? []
+  const profiles = state?.models ?? []
+
+  async function request(operation, body) {
+    if (requesting) return
+    setRequesting(true)
+    setConfirmStop(null)
+    try {
+      const result = await ctx.rest(`/runtime/${operation}`, { method: 'POST', body, timeoutMs: 18_000 })
+      if (!result.ok) throw new Error(result.error || 'The operation failed.')
+      if (operation === 'setup-provider') host.notify({ kind: 'success', message: 'Strata Backend is available in the Hermes model picker.' })
+      await serving.refetch()
+    } catch (error) {
+      host.notifyError(error, 'Could not manage the Strata provider')
+    } finally {
+      setRequesting(false)
+    }
+  }
+
+  return jsxs('section', {
+    className: sectionClass,
+    children: [
+      jsx('h2', { className: 'font-medium', children: 'Hermes provider' }),
+      jsx('p', { className: 'text-(--ui-text-secondary)', children: state?.provider_ready
+        ? 'Strata Backend is available in the Hermes model picker. Start a profile before using it.'
+        : 'Set up the local provider to list your downloaded model profiles in the Hermes model picker.' }),
+      jsx('div', { children: jsx('button', {
+        type: 'button', className: buttonClass, disabled: busy || requesting || !profiles.length,
+        onClick: () => void request('setup-provider'), children: state?.provider_ready ? 'Refresh Hermes provider' : 'Set up Hermes provider',
+      }) }),
+      profiles.length > 0 && jsx('ul', {
+        className: 'divide-y divide-(--ui-stroke-secondary)',
+        children: profiles.map(profile => {
+          const running = rows.some(row => row.profile_id === profile.profile_id && row.state !== 'exited')
+          return jsxs('li', {
+            className: 'flex flex-wrap items-center justify-between gap-2 py-2',
+            children: [
+              jsxs('div', { children: [jsx('div', { children: profile.name }),
+                jsx('div', { className: 'text-(--ui-text-secondary)', children: `${profile.model_title} · Picker ID ${profile.id}` })] }),
+              jsx('button', {
+                type: 'button', className: buttonClass, disabled: busy || requesting || running,
+                onClick: () => onStart(profile.profile_id), children: running ? 'Running' : 'Start profile',
+              }),
+            ],
+          }, profile.profile_id)
+        }),
+      }),
+      jsx('h3', { className: 'font-medium', children: 'Strata processes' }),
+      !rows.length && jsx('p', { className: 'text-(--ui-text-secondary)', children: 'No Strata processes detected.' }),
+      rows.length > 0 && jsx('ul', {
+        className: 'divide-y divide-(--ui-stroke-secondary)',
+        children: rows.map(row => jsxs('li', {
+          className: 'flex flex-wrap items-center justify-between gap-2 py-2',
+          children: [
+            jsxs('div', { className: 'min-w-0 break-words', children: [
+              jsx('div', { children: `${row.name} · ${row.state}` }),
+              jsx('div', { className: 'text-(--ui-text-secondary)', children: [row.managed ? 'Managed' : 'External', row.pid && `PID ${row.pid}`, row.path].filter(Boolean).join(' · ') }),
+              row.log && jsxs('details', { children: [jsx('summary', { children: 'Server log' }),
+                jsx('pre', { className: 'max-h-48 overflow-auto whitespace-pre-wrap text-xs', children: row.log })] }),
+            ] }),
+            row.state !== 'exited' && jsx('button', {
+              type: 'button', className: buttonClass, disabled: requesting,
+              onClick: () => row.managed ? void request('stop-instance', row) : setConfirmStop(row), children: 'Stop process',
+            }),
+          ],
+        }, `${row.pid}:${row.started}`)),
+      }),
+      confirmStop && jsxs('div', {
+        className: 'flex flex-wrap items-center gap-2',
+        children: [jsx('span', { children: `Stop external Strata process ${confirmStop.pid}?` }),
+          jsx('button', { type: 'button', className: buttonClass, onClick: () => void request('stop-instance', confirmStop), children: 'Confirm stop' }),
+          jsx('button', { type: 'button', className: buttonClass, onClick: () => setConfirmStop(null), children: 'Cancel' })],
+      }),
+      (serving.isError || state?.error) && jsx('p', { role: 'alert', children: state?.error ?? 'Could not read Strata process status.' }),
     ],
   })
 }
@@ -516,6 +602,7 @@ function StrataPage({ ctx }) {
     update: 'Updating and building Strata…',
     wipe: 'Removing managed Strata files…',
     download: 'Downloading model files…',
+    serve: 'Preparing the model and starting Strata…',
   }
   const busyLabel = operationLabels[data?.operation]
   const updateAvailable = Boolean(latest.data?.update_available)
@@ -649,6 +736,8 @@ function StrataPage({ ctx }) {
         ctx, queryScope, library: library.data, revision: data?.ready ? data.revision : null,
         onSave: () => queryClient.invalidateQueries({ queryKey: libraryKey, exact: true }),
       }, `profiles:${scopeKey}`),
+      connected && data && jsx(ServingControls, { ctx, queryScope, busy: pending,
+        onStart: id => void run('start-profile', { id }) }, `serving:${scopeKey}`),
     ],
   })
 }
