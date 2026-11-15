@@ -1,6 +1,6 @@
 # Strata Backend
 
-Strata Backend is a self-contained Hermes Desktop plugin. Its sidebar entry opens the **Strata Backend** workspace page. The version pill in the bottom-right status bar checks the installed checkout's tracked GitHub branch and offers a one-click update when the branch can fast-forward.
+Strata Backend is a self-contained Hermes Desktop plugin. Its sidebar entry opens the **Strata Backend** workspace page. The version pill in the bottom-right status bar checks the installed checkout's tracked GitHub branch every two minutes while Hermes is open. Click the current version to check immediately, or click the update badge to apply an available update.
 
 ## Install
 
@@ -17,7 +17,7 @@ Open **Strata Backend** in the sidebar and choose **Download and set up**. The p
 
 Use **Update Strata** to fast-forward the managed checkout and run setup again. **Fresh wipe** removes only the managed Strata directory in this Hermes profile, including its venv, downloaded models, build products, and setup files.
 
-Once the engine is ready, **Suggested models** shows Strata's hardware-based recommendation and its catalog. Choose **Download** on a specific entry to fetch its weights. The page lists download size separately from the memory estimate. Downloads do not start a model or change the Hermes provider.
+Once the engine is ready, **Suggested models** shows Strata's hardware-based recommendation and its catalog. Choose **Download** on a specific entry to fetch its weights. **Open models folder** opens the local profile's managed downloads in the file manager, including when the folder is empty. The page lists download size separately from the memory estimate. Downloads do not start a model or change the Hermes provider.
 
 Under **Hugging Face models**, enter an `owner/repo` and optionally an exact GGUF filename or quantization. For example, enter `unsloth/Qwen3.8-27B-GGUF` and `Qwen3.8-27B-UD-Q4_K_M.gguf`. The picker groups complete shard sets. The Hub client runs in the managed venv and uses the existing Hugging Face login and cache. External GGUF downloads are listed with compatibility unverified.
 

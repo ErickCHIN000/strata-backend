@@ -8,6 +8,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const title = 'Strata Backend'
 const path = '/strata-backend'
 const hour = 60 * 60 * 1000
+const pluginUpdateInterval = 2 * 60 * 1000
 const buttonClass = 'rounded-md border border-(--ui-stroke-secondary) px-3 py-1.5 text-sm hover:text-(--ui-accent) disabled:opacity-50'
 const inputClass = 'w-full rounded-md border border-(--ui-stroke-secondary) bg-transparent px-2 py-1.5 text-sm'
 const sectionClass = 'flex flex-col gap-3 border-t border-(--ui-stroke-secondary) pt-4'
@@ -473,6 +474,19 @@ function StrataPage({ ctx }) {
   const downloads = new Set(modelDownloads.map(model => model.id))
   const scopeKey = JSON.stringify([connection, profile])
   const modelButtons = { downloads, busy: pending || !connected, onDownload: body => void run('download', body) }
+  const activeRoute = host.profileRoutes?.().find(route => route.connectionId === (connection ?? 'local') && route.profile === profile)
+  const localBackend = activeRoute ? activeRoute.mode === 'local' : connection == null || connection === 'local'
+  const modelsFolder = library.data?.models_folder
+
+  async function openModelsFolder() {
+    if (!localBackend || !modelsFolder) return
+    try {
+      const result = await window.hermesDesktop?.openDir?.(modelsFolder)
+      if (!result?.ok) throw new Error(result?.error || 'Opening folders requires Hermes Desktop.')
+    } catch (error) {
+      host.notifyError(error, 'Could not open the Strata models folder')
+    }
+  }
 
   return jsxs('section', {
     className: 'mx-auto flex w-full max-w-3xl flex-col gap-4 p-6 text-sm',
@@ -507,6 +521,11 @@ function StrataPage({ ctx }) {
           jsx('button', {
             type: 'button', className: buttonClass, disabled: !connected || !data || pending || latest.isFetching,
             onClick: () => void latest.refetch(), children: 'Check for updates',
+          }),
+          jsx('button', {
+            type: 'button', className: buttonClass, disabled: !connected || !modelsFolder || !localBackend || data?.operation === 'wipe',
+            title: localBackend ? undefined : 'The models folder is on the connected backend.',
+            onClick: () => void openModelsFolder(), children: 'Open models folder',
           }),
           data?.has_data && !confirmWipe && jsx('button', {
             type: 'button', className: buttonClass, disabled: !connected || pending,
@@ -581,12 +600,14 @@ function VersionPill({ ctx }) {
   const profile = useValue(host.state.profile)
   const gateway = useValue(host.state.gateway)
   const queryKey = [ctx.source, 'version-status', connection, profile]
-  const { data, isError } = useQuery({
+  const { data, isError, isFetching, refetch } = useQuery({
     queryKey,
     queryFn: () => ctx.rest('/version-status'),
     enabled: gateway === 'open',
-    staleTime: hour,
-    refetchInterval: hour,
+    staleTime: pluginUpdateInterval,
+    refetchInterval: pluginUpdateInterval,
+    refetchIntervalInBackground: true,
+    refetchOnReconnect: 'always',
     retry: false,
   })
   const updateLock = useRef(false)
@@ -616,10 +637,12 @@ function VersionPill({ ctx }) {
   const label = data?.current ? `Strata ${data.current}` : title
   const baseClass = 'inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)'
   if (!data?.update_available && !isUpdating) {
-    return jsx('span', {
-      className: baseClass,
-      title: data?.error ?? (isError ? 'Strata Backend version check unavailable' : title),
-      children: label,
+    return jsx('button', {
+      type: 'button', className: `${baseClass} hover:text-(--ui-text-secondary)`,
+      disabled: gateway !== 'open' || isFetching,
+      'aria-label': 'Check for Strata Backend updates',
+      title: data?.error ?? (isError ? 'Retry Strata Backend update check' : 'Check for Strata Backend updates'),
+      onClick: () => void refetch(), children: isFetching ? `${label} · Checking…` : label,
     })
   }
 

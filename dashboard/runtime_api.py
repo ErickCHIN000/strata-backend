@@ -434,6 +434,9 @@ def profile_directory(root):
 def model_library():
     try:
         root = strata_directory()
+        models_folder = root / "models"
+        if models_folder.resolve() != models_folder:
+            raise ValueError("The managed models folder moved outside the Strata installation.")
         directory = profile_directory(root)
         profiles = []
         for file in directory.glob("*.json"):
@@ -443,7 +446,8 @@ def model_library():
                     profiles.append(profile)
             except (OSError, ValueError):
                 continue
-        return {"models": downloaded_models(root), "profiles": sorted(profiles, key=lambda p: p["name"].casefold())}
+        return {"models": downloaded_models(root), "models_folder": str(models_folder),
+                "profiles": sorted(profiles, key=lambda p: p["name"].casefold())}
     except (OSError, ValueError):
         return {"error": "Could not read managed models and profiles."}
 
