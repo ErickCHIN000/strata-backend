@@ -27,7 +27,9 @@ The **Use SC117 Flash-Next IQ3_S** shortcut fills the model repository and quant
 
 **Model profiles** save common memory and context settings, raw Strata engine, launch, setup and server arguments, environment variables, and run config overrides. The option reference comes from the installed build. The Model picker lists completed downloads, and **Any model** creates a reusable preset. Fresh wipe preserves profiles and the shared Hugging Face cache.
 
-Use **Delete model** under **Downloaded models** to remove that download from the managed model folder. Use **Delete profile** under **Model profiles** to remove the selected preset. Both ask for confirmation. Stop a running profile and switch the Hermes default away from it before deleting it or its download.
+For files downloaded with `hf download --local-dir`, click **Add Model** under **Models**, enter the full folder or GGUF path, then **Scan folder**. Choose the complete shard set, optionally attach an `mmproj` GGUF found in that folder, and click **Add Model**. For example, scan `F:\Models\Huihui-Flash-Next-v2` and choose the two files under `swift-IQ3_S`. The entry uses the existing files and appears in the profile’s Model dropdown. A projector is recorded with the model; image inference requires a configured Strata vision reader. Complete downloads are required. Add the same model again to update its display name or projector.
+
+Use **Delete model** under **Models** to remove a managed download. Locally added files have **Remove model**, which removes their library registration and keeps the original files in place. Use **Delete profile** under **Model profiles** to remove the selected preset. These actions ask for confirmation. Stop a running profile and switch the Hermes default away from it before deleting it or its download.
 
 ## Use a profile in Hermes
 

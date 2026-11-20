@@ -1,6 +1,7 @@
 import {
   ROUTES_AREA, SIDEBAR_NAV_AREA, STATUSBAR_AREAS, host, haptic, useQuery, queryClient, useValue,
-  ConfirmDialog, Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
+  ConfirmDialog, Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
+  Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
 } from '@hermes/plugin-sdk'
 import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -282,15 +283,103 @@ function OptionReference({ ctx, queryScope, revision, enabled }) {
   })
 }
 
+function AddLocalModelDialog({ ctx, onClose, onAdded }) {
+  const [folder, setFolder] = useState('')
+  const [catalog, setCatalog] = useState(null)
+  const [group, setGroup] = useState('')
+  const [projector, setProjector] = useState('')
+  const [name, setName] = useState('')
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState('')
+  const lock = useRef(false)
+
+  async function submit(event) {
+    event.preventDefault()
+    if (lock.current) return
+    lock.current = true
+    setPending(true)
+    setError('')
+    try {
+      if (!catalog) {
+        const result = await ctx.rest('/runtime/local-model-files', {
+          method: 'POST', body: { path: folder }, timeoutMs: 60_000,
+        })
+        if (result.error) throw new Error(result.error)
+        setCatalog(result)
+        setGroup(result.selected ?? '')
+        setName(result.groups.find(item => item.id === result.selected)?.label ?? '')
+        setProjector(result.projectors.length === 1 ? result.projectors[0] : '')
+      } else {
+        const result = await ctx.rest('/runtime/add-local-model', {
+          method: 'POST', body: { path: catalog.path, group, projector: projector || null, name }, timeoutMs: 60_000,
+        })
+        if (!result.ok) throw new Error(result.error || 'Could not add the local model.')
+        if (result.warning) host.notify({ kind: 'info', message: result.warning })
+        await onAdded()
+        onClose()
+      }
+    } catch (failure) {
+      setError(failure?.message ?? 'Could not read the local model.')
+    } finally {
+      lock.current = false
+      setPending(false)
+    }
+  }
+
+  return jsx(Dialog, {
+    open: true, onOpenChange: open => { if (!open && !pending) onClose() },
+    children: jsxs(DialogContent, {
+      className: 'max-w-xl',
+      children: [
+        jsxs(DialogHeader, { children: [
+          jsx(DialogTitle, { children: 'Add Model' }),
+          jsx(DialogDescription, { children: 'Use GGUF files already downloaded on the Hermes backend. Files stay in the selected folder.' }),
+        ] }),
+        jsxs('form', { className: 'flex flex-col gap-3', onSubmit: submit, children: [
+          jsxs('label', { children: ['Model folder or GGUF file', jsx('input', {
+            className: inputClass, required: true, disabled: pending, value: folder,
+            placeholder: 'F:\\Models\\Huihui-Flash-Next-v2',
+            onChange: event => { setFolder(event.target.value); setCatalog(null); setError('') },
+          })] }),
+          catalog && jsx(ThemedSelect, {
+            label: 'GGUF model', value: group, disabled: pending,
+            placeholder: 'Choose a complete shard set',
+            options: catalog.groups.map(item => [item.id, `${item.label} · ${downloadSize(item.bytes)}`]),
+            onChange: value => { setGroup(value); setName(catalog.groups.find(item => item.id === value)?.label ?? '') },
+          }),
+          catalog && jsxs('label', { children: ['Model name', jsx('input', {
+            className: inputClass, required: true, maxLength: 250, disabled: pending,
+            value: name, onChange: event => setName(event.target.value),
+          })] }),
+          catalog && jsx(ThemedSelect, {
+            label: 'Vision projector (optional)', value: projector, disabled: pending,
+            options: [['', 'None'], ...catalog.projectors.map(file => [file, file])], onChange: setProjector,
+          }),
+          catalog && jsx('p', { className: 'text-(--ui-text-secondary)',
+            children: 'The attached projector is saved with the model. Image inference requires a configured Strata vision reader.' }),
+          error && jsx('p', { role: 'alert', children: error }),
+          jsxs(DialogFooter, { children: [
+            jsx('button', { type: 'button', className: buttonClass, disabled: pending, onClick: onClose, children: 'Cancel' }),
+            jsx('button', {
+              type: 'submit', className: buttonClass, disabled: pending || !folder.trim() || Boolean(catalog && !group),
+              children: pending ? 'Checking files…' : catalog ? 'Add Model' : 'Scan folder',
+            }),
+          ] }),
+        ] }),
+      ],
+    }),
+  })
+}
+
 function LibraryDeleteDialog({ ctx, target, onClose, onDeleted }) {
   return jsx(ConfirmDialog, {
     open: true,
     destructive: true,
-    title: target.kind === 'model' ? 'Delete downloaded model?' : 'Delete saved profile?',
-    description: target.kind === 'model'
+    title: target.local ? 'Remove local model?' : target.kind === 'model' ? 'Delete downloaded model?' : 'Delete saved profile?',
+    description: target.local ? `Remove “${target.name}” from the model list? The original GGUF files stay in their folder.` : target.kind === 'model'
       ? `Are you sure you want to delete the downloaded files for “${target.name}”? Its saved profiles will remain.`
       : `Are you sure you want to delete “${target.name}”? Its downloaded model will remain.`,
-    confirmLabel: 'Delete',
+    confirmLabel: target.local ? 'Remove' : 'Delete',
     busyLabel: 'Deleting…',
     doneLabel: 'Deleted',
     onClose,
@@ -312,7 +401,7 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
   const [deleteProfile, setDeleteProfile] = useState(null)
   const profiles = library?.profiles ?? []
   const savedProfile = profiles.find(profile => profile.id === draft.id)
-  const entries = new Map((library?.models ?? []).map(model => [model.id, model.title]))
+  const entries = new Map((library?.models ?? []).filter(model => model.available !== false).map(model => [model.id, model.title]))
   const missingModel = draft.model_id && !entries.has(draft.model_id)
 
   function edit(name, value) {
@@ -621,6 +710,7 @@ function StrataPage({ ctx }) {
   const [requesting, setRequesting] = useState(false)
   const [confirmWipe, setConfirmWipe] = useState(false)
   const [deleteModel, setDeleteModel] = useState(null)
+  const [addingModel, setAddingModel] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const [pausing, setPausing] = useState(false)
   const pending = requesting || Boolean(data?.operation)
@@ -788,10 +878,16 @@ function StrataPage({ ctx }) {
       }),
       data?.ready && jsx(ModelSuggestions, { catalog: models, ...modelButtons }),
       data?.ready && jsx(HuggingFaceModels, { ctx, ...modelButtons }, `hf:${scopeKey}`),
-      modelDownloads.length > 0 && jsxs('section', {
+      jsxs('section', {
         className: sectionClass,
         children: [
-          jsx('h2', { className: 'font-medium', children: 'Downloaded models' }),
+          jsxs('div', { className: 'flex flex-wrap items-center justify-between gap-2', children: [
+            jsx('h2', { className: 'font-medium', children: 'Models' }),
+            jsx('button', {
+              type: 'button', className: buttonClass, disabled: !connected || pending,
+              onClick: () => setAddingModel(true), children: 'Add Model',
+            }),
+          ] }),
           jsx('ul', {
             className: 'divide-y divide-(--ui-stroke-secondary)',
             children: modelDownloads.map(model => jsxs('li', {
@@ -801,20 +897,26 @@ function StrataPage({ ctx }) {
                   jsx('div', { children: model.title }),
                   jsx('div', {
                     className: 'text-(--ui-text-secondary)',
-                    children: [model.repo, downloadSize(model.bytes)].filter(Boolean).join(' · '),
+                    children: [model.directory ?? model.repo, downloadSize(model.bytes),
+                      model.available === false && 'Local files missing',
+                      model.projector && 'Vision projector attached'].filter(Boolean).join(' · '),
                   }),
                 ] }),
                 jsx('button', {
                   type: 'button', className: buttonClass, disabled: !connected || pending,
                   'aria-label': `Delete ${model.title}`,
-                  onClick: () => setDeleteModel({ kind: 'model', id: model.id, name: model.title, scope: scopeKey }),
-                  children: 'Delete model',
+                  onClick: () => setDeleteModel({ kind: 'model', id: model.id, name: model.title, scope: scopeKey, local: model.source === 'local' }),
+                  children: model.source === 'local' ? 'Remove model' : 'Delete model',
                 }),
               ],
             }, model.id)),
           }),
         ],
       }),
+      addingModel && jsx(AddLocalModelDialog, {
+        ctx, onClose: () => setAddingModel(false),
+        onAdded: () => queryClient.invalidateQueries({ queryKey: libraryKey, exact: true }),
+      }, `local:${scopeKey}`),
       deleteModel?.scope === scopeKey && jsx(LibraryDeleteDialog, {
         ctx, target: deleteModel, onClose: () => setDeleteModel(null),
         onDeleted: async () => {

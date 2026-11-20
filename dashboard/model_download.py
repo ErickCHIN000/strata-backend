@@ -9,6 +9,7 @@ import shutil
 import sys
 from pathlib import Path, PureWindowsPath
 from time import monotonic, sleep
+from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 
@@ -113,6 +114,94 @@ def gguf_groups(siblings):
             ordered = [files[index] for index in range(1, total + 1)]
             singles.append({"id": ordered[0]["name"], "label": f"{prefix} ({total} shards)", "files": ordered})
     return sorted(singles, key=lambda group: group["id"].casefold())
+
+
+def local_catalog(payload):
+    value = (payload or {}).get("path")
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ValueError("Enter a local model folder or GGUF file path.")
+    path = Path(value.strip().strip('"')).expanduser()
+    if not path.is_absolute():
+        raise ValueError("Enter the full path to the model folder or GGUF file.")
+    path = Path(os.path.abspath(path))
+    selected_file = path if path.is_file() else None
+    directory = path.parent if selected_file else path
+    if not directory.is_dir() or (selected_file and selected_file.suffix.lower() != ".gguf"):
+        raise ValueError("The local model folder or GGUF file could not be found.")
+    weights, projectors = [], []
+    for parent, dirs, files in os.walk(directory):
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        for name in files:
+            if not name.lower().endswith(".gguf"):
+                continue
+            file = Path(parent) / name
+            relative = file.relative_to(directory).as_posix()
+            if name.lower().startswith("mmproj"):
+                projectors.append(relative)
+            elif not name.lower().startswith(("mtp-", "mtp_", "draft-")):
+                weights.append(SimpleNamespace(rfilename=relative, size=file.stat().st_size, lfs=None))
+    groups = gguf_groups(weights)
+    if selected_file:
+        relative = selected_file.relative_to(directory).as_posix()
+        groups = [group for group in groups if any(file["name"] == relative for file in group["files"])]
+    if not groups:
+        raise ValueError("No complete GGUF model was found. Wait for every shard to finish downloading, then scan again.")
+    for group in groups:
+        group["bytes"] = sum(file["bytes"] for file in group["files"])
+    return {"path": str(directory), "groups": groups, "projectors": sorted(projectors),
+            "selected": groups[0]["id"] if len(groups) == 1 else None}
+
+
+def inspect_local_model(root, payload):
+    catalog = local_catalog(payload)
+    group = next((item for item in catalog["groups"] if item["id"] == payload.get("group")), None)
+    if group is None:
+        raise ValueError("Scan the folder and choose a complete GGUF file or shard set.")
+    directory = Path(catalog["path"])
+    files = [directory / file["name"] for file in group["files"]]
+    sys.path.insert(0, str(root / "source" / "tools"))
+    from gguf_reader import GGUFFile
+
+    headers = [GGUFFile(file) for file in files]
+    first = headers[0].metadata
+    if not isinstance(first.get("general.architecture"), str):
+        raise ValueError("The first GGUF shard has no model architecture.")
+    seen = set()
+    for index, header in enumerate(headers):
+        meta = header.metadata
+        if len(files) > 1 and (meta.get("split.count") != len(files) or meta.get("split.no") != index
+                              or meta.get("split.tensors.count") != first.get("split.tensors.count")):
+            raise ValueError("The GGUF shards do not belong to one complete split model.")
+        if len(files) == 1 and int(meta.get("split.count", 1)) > 1:
+            raise ValueError("The GGUF declares multiple shards. Download the complete set first.")
+        size = header.path.stat().st_size
+        for tensor in header.tensors:
+            length = tensor.expected_bytes()
+            if tensor.name in seen or length is None or header.data_start + tensor.offset + length > size:
+                raise ValueError(f"The GGUF contains an incomplete, unsupported, or repeated tensor: {tensor.name}.")
+            seen.add(tensor.name)
+    if first.get("split.tensors.count") is not None and len(seen) != first["split.tensors.count"]:
+        raise ValueError("The GGUF shard set does not contain all declared tensors.")
+    projector = payload.get("projector") or None
+    if projector:
+        if projector not in catalog["projectors"]:
+            raise ValueError("Choose a vision projector from the scanned folder.")
+        projector = str(directory / projector)
+        header = GGUFFile(Path(projector))
+        if header.metadata.get("general.architecture") != "clip":
+            raise ValueError("The selected projector is not a CLIP vision GGUF.")
+        for tensor in header.tensors:
+            length = tensor.expected_bytes()
+            if length is None or header.data_start + tensor.offset + length > header.path.stat().st_size:
+                raise ValueError("The vision projector has an incomplete or unsupported tensor.")
+    name = payload.get("name") or group["label"]
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 250:
+        raise ValueError("Enter a model name up to 250 characters.")
+    identity = "local:" + hashlib.sha256(os.path.normcase(str(files[0])).encode("utf-8")).hexdigest()
+    return {"id": identity, "source": "local", "title": name.strip(), "directory": str(directory),
+            "files": [str(file) for file in files], "bytes": group["bytes"], "projector": projector,
+            "architecture": first["general.architecture"],
+            "context_length": first.get(first["general.architecture"] + ".context_length")}
 
 
 def select_group(groups, filename):
@@ -360,9 +449,11 @@ if __name__ == "__main__":
     try:
         if action == "files":
             print(json.dumps(hf_catalog(data["repo"], data.get("filename"))))
+        elif action == "local":
+            print(json.dumps(inspect_local_model(Path(root), data)))
         elif action == "download":
             download_model(Path(root).resolve(), data)
         else:
             raise ValueError("Unknown model operation.")
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         sys.exit(str(exc))

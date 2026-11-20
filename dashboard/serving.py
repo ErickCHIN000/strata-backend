@@ -54,7 +54,7 @@ def profile_id(value):
 
 
 def model_roster(library):
-    models = {item["id"]: item for item in library.get("models", [])}
+    models = {item["id"]: item for item in library.get("models", []) if item.get("available") is not False}
     roster = {}
     for profile in library.get("profiles", []):
         model = models.get(profile.get("model_id"))
@@ -289,6 +289,13 @@ def configure_provider(root, roster):
 def catalog_shards(root, model):
     import hashlib
 
+    if model.get("source") == "local":
+        paths = [Path(name) for name in model["files"]]
+        if not paths or any(not path.is_absolute() or path.suffix.lower() != ".gguf" or not path.is_file() for path in paths):
+            raise ValueError("The local GGUF files are missing. Restore them or add the model from its new folder.")
+        if len({path.parent for path in paths}) != 1:
+            raise ValueError("Keep every shard of the local model in the same folder.")
+        return paths
     folder = root / "models" / hashlib.sha256(model["id"].encode("utf-8")).hexdigest()[:20]
     paths = [(folder / name).resolve() for name in model["files"] if isinstance(name, str) and name.lower().endswith(".gguf")]
     if not paths or any(not path.is_relative_to(folder) or not path.is_file() for path in paths):
@@ -324,7 +331,7 @@ def windows_commit_available():
     return None
 
 
-def prepare_external_flash_next(root, profile, weights):
+def prepare_external_flash_next(root, profile, weights, model=None):
     source = root / "source"
     tools = source / "tools"
     sys.path.insert(0, str(tools))
@@ -346,18 +353,30 @@ def prepare_external_flash_next(root, profile, weights):
     if engine is None:
         raise ValueError("Set up the native Strata engine before preparing a custom Flash-Next pack.")
     gguf_py = source / "third_party" / "llama.cpp" / "gguf-py"
-    model_folder = weights[0].relative_to(root / "models").parts[0]
+    if model:
+        import hashlib
+
+        model_folder = hashlib.sha256(model["id"].encode("utf-8")).hexdigest()[:20]
+    else:
+        model_folder = weights[0].relative_to(root / "models").parts[0]
     pack = root / "run-data" / "packs" / f"external-{model_folder}"
+    if pack.resolve() != pack:
+        raise ValueError("The custom pack folder moved outside the managed Strata installation.")
     revision = (root / "prepared-commit").read_text(encoding="ascii").strip()
     stamp = pack / "strata-revision.json"
     tokenizer = pack / "tokenizer"
-    if (read_json(stamp).get("revision") != revision or not (pack / "native_experts.txt").is_file()
+    fingerprints = [{"path": str(path), "size": path.stat().st_size, "mtime_ns": path.stat().st_mtime_ns} for path in weights]
+    expected = {"revision": revision, "weights": fingerprints}
+    if (read_json(stamp) != expected or not (pack / "native_experts.txt").is_file()
             or not (tokenizer / "chat_template.jinja").is_file() or not (tokenizer / "vocab.json").is_file()):
         print("Preparing custom Flash-Next pack from the downloaded GGUF shards.", flush=True)
         subprocess.run([sys.executable, "-B", str(tools / "iq_pack.py"), "--gguf", str(weights[0]),
                         "--out", str(pack), "--compat-bf16"], cwd=source,
                        env={**os.environ, "STRATA_GGUF_PY": str(gguf_py)}, check=True)
-        write_json(stamp, {"revision": revision})
+        subprocess.run([sys.executable, "-B", str(tools / "strata_tokenizer.py"), "--gguf", str(weights[0]),
+                        "--out", str(pack)], cwd=source,
+                       env={**os.environ, "STRATA_GGUF_PY": str(gguf_py)}, check=True)
+        write_json(stamp, expected)
 
     context = str(profile.get("controls", {}).get("--max-context") or 32768)
     args = ["--pack", str(pack), "--native", str(weights[0]), "--ple-gguf", str(tables[0]),
@@ -382,12 +401,15 @@ def prepare_config(root, profile, model, destination):
     import setup as strata
 
     weights = catalog_shards(root, model)
+    if model["source"] == "local":
+        write_json(destination, prepare_external_flash_next(root, profile, weights, model))
+        return
     if model["source"] == "catalog":
         family, size = model["family"], model["model"]
     else:
         match = strata.gguf_choice(weights[0].name)
         if match is None:
-            write_json(destination, prepare_external_flash_next(root, profile, weights))
+            write_json(destination, prepare_external_flash_next(root, profile, weights, model))
             return
         family, size = match
     fam = (strata.FAMILIES.get(family) or strata.OWN_PATH_FAMILIES.get(family) or {})

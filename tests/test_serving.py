@@ -14,6 +14,24 @@ from dashboard import serving
 
 
 class ServingTests(unittest.TestCase):
+    def test_local_catalog_named_files_use_a_separate_custom_pack(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            local = root / "user-files" / "Swift-IQ3_S-00001-of-00002.gguf"
+            local.parent.mkdir()
+            local.touch()
+            model = {"id": "local:custom", "source": "local", "files": [str(local)]}
+            destination = root / "server.json"
+            config = {"exe": "engine", "args": ["--pack", "local-pack"], "tokenizer": "local-tokenizer"}
+            with (
+                patch.dict("sys.modules", {"setup": SimpleNamespace(gguf_choice=lambda _: self.fail("Catalog setup was used"))}),
+                patch.object(serving.sys, "path", serving.sys.path.copy()),
+                patch.object(serving, "prepare_external_flash_next", return_value=config) as prepare,
+            ):
+                serving.prepare_config(root, {}, model, destination)
+            prepare.assert_called_once_with(root, {}, [local], model)
+            self.assertEqual(serving.read_json(destination), config)
+
     def test_clearing_exited_instances_preserves_the_running_row_and_launch_record(self):
         with TemporaryDirectory() as temp:
             root = Path(temp).resolve()
@@ -62,13 +80,16 @@ class ServingTests(unittest.TestCase):
 
     def test_external_flash_next_pack_uses_each_models_own_tokenizer_and_ple(self):
         with TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             source = root / "source"
             engine = source / "engine" / ("strata.exe" if os.name == "nt" else "strata")
             engine.parent.mkdir(parents=True)
             engine.touch()
             (root / "prepared-commit").write_text("revision", encoding="ascii")
             first, second = (root / "models" / "model-id" / f"custom-{index}.gguf" for index in (1, 2))
+            first.parent.mkdir(parents=True)
+            first.touch()
+            second.touch()
             pack = root / "run-data" / "packs" / "external-model-id"
 
             def header(path):
@@ -78,7 +99,7 @@ class ServingTests(unittest.TestCase):
             with patch.dict("sys.modules", {"gguf_reader": SimpleNamespace(GGUFFile=header)}), \
                     patch.object(serving.sys, "path", serving.sys.path.copy()), patch.object(serving.subprocess, "run") as run:
                 config = serving.prepare_external_flash_next(root, {}, [first, second])
-            self.assertIn("--compat-bf16", run.call_args.args[0])
+            self.assertIn("--compat-bf16", run.call_args_list[0].args[0])
             self.assertEqual(config["tokenizer"], str(pack / "tokenizer"))
             self.assertEqual(config["args"][config["args"].index("--ple-gguf") + 1], str(second))
 

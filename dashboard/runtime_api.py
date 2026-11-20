@@ -446,6 +446,47 @@ def hf_files(payload):
         return {"error": "The Hugging Face client could not be prepared or the Hub did not respond."}
 
 
+def local_model_files(payload):
+    try:
+        return runpy.run_path(str(MODEL_HELPER))["local_catalog"](payload)
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
+def add_local_model(payload):
+    from hermes_cli.plugins_auto_update import plugin_update_lock
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    try:
+        root = strata_directory()
+        if not strata_python(root).is_file() or not (root / "source" / "tools" / "gguf_reader.py").is_file():
+            raise ValueError("Set up Strata before adding a local model.")
+        with plugin_update_lock(root):
+            result = subprocess.run(
+                [str(strata_python(root)), "-B", str(MODEL_HELPER), "local", str(root)],
+                input=json.dumps(payload or {}), capture_output=True, encoding="utf-8",
+                env=managed_environment(root), timeout=45,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode:
+                raise ValueError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "Could not inspect the local GGUF files.")
+            record = json.loads(result.stdout)
+            folder = runpy.run_path(str(MODEL_HELPER))["managed_dir"](root, record["id"])
+            with strata_jobs_lock:
+                if root in strata_jobs:
+                    raise ValueError("Wait for the current Strata operation to finish.")
+                serving_tools()["write_json"](folder / "model.json", record)
+                try:
+                    sync_serving_profiles(root)
+                except (ValueError, OSError, ImportError):
+                    return {"ok": True, "model": record, "warning": "Model added. Refresh the Strata provider to update the model picker."}
+            return {"ok": True, "model": record}
+    except (ValueError, PluginOperationError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except (OSError, subprocess.SubprocessError, KeyError, TypeError):
+        return {"ok": False, "error": "Could not add the local model. Check the file paths and access permissions."}
+
+
 def downloaded_models(root):
     records = []
     for marker in (root / "models").glob("*/model.json"):
@@ -453,8 +494,12 @@ def downloaded_models(root):
             record = json.loads(marker.read_text(encoding="utf-8"))
             if (marker.parent.resolve() == marker.parent and isinstance(record, dict)
                     and isinstance(record.get("title"), str) and isinstance(record.get("id"), str)
-                    and isinstance(record.get("files"), list) and record["files"]
-                    and all((marker.parent / name).is_file() for name in record["files"])):
+                    and isinstance(record.get("files"), list) and record["files"]):
+                available = all(isinstance(name, str) and (marker.parent / name).is_file() for name in record["files"])
+                if record.get("source") == "local":
+                    record["available"] = available
+                elif not available:
+                    continue
                 records.append(record)
         except (OSError, ValueError, TypeError):
             continue
@@ -619,7 +664,10 @@ def delete_library_entry(kind, payload):
                 if key in affected or (kind == "model" and running_model == item_id):
                     raise ValueError("Stop the Strata profile using this item before deleting it.")
 
-            if kind == "model":
+            if kind == "model" and record.get("source") == "local":
+                (path / "model.json").unlink()
+                path.rmdir()
+            elif kind == "model":
                 # Keep the marker until the files are gone so a failed unlink can be retried.
                 marker = path / "model.json"
                 for entry in path.iterdir():
@@ -956,6 +1004,7 @@ GET_HANDLERS = {"status": strata_status, "latest": strata_latest, "models": stra
                 "library": model_library, "model-options": model_option_reference, "serving": serving_status}
 POST_HANDLERS = {action: partial(strata_action, action) for action in ("setup", "update", "wipe", "download")}
 POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile,
+                      "local-model-files": local_model_files, "add-local-model": add_local_model,
                       "delete-model": partial(delete_library_entry, "model"),
                       "delete-profile": partial(delete_library_entry, "profile"),
                       "pause-download": pause_download, "resume-download": resume_download,
