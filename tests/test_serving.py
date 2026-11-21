@@ -1,7 +1,9 @@
+import asyncio
 import io
 import json
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -14,6 +16,108 @@ from dashboard import serving
 
 
 class ServingTests(unittest.TestCase):
+    def test_shared_bot_requests_are_served_in_order(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp).resolve() / "strata-runtime"
+            directory = serving.service_root(root)
+            alias, key = "iq3-profile", "a" * 32
+            serving.write_json(root.parent / "profile-access.json", {"profiles": ["bot-a", "bot-b"]})
+            serving.write_json(directory / "provider.json", {"port": 12345, "key": "test"})
+            serving.write_json(directory / "models.json", {alias: {"profile_id": key}})
+            serving.write_json(serving.instance_file(directory, key), {"model": alias, "port": 12346, "key": "engine"})
+            active, peak = 0, 0
+
+            class Tokens(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    nonlocal active
+                    try:
+                        await asyncio.sleep(0.05)
+                        yield b'{"ok": true}'
+                    finally:
+                        active -= 1
+
+            async def send(*args, **kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(active, peak)
+                return httpx.Response(200, stream=Tokens())
+
+            with (
+                patch("uvicorn.Server") as server,
+                patch.object(serving, "Thread"),
+                patch.object(serving, "launch_shared_profile", return_value=True),
+                patch.object(serving, "process_for", return_value=object()),
+                patch.object(serving, "online", return_value=True),
+                patch.object(httpx.AsyncClient, "send", side_effect=send),
+            ):
+                serving.serve_bridge(directory)
+                app = server.call_args.args[0].app
+                with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+                    def request(_index):
+                        return client.post("/v1/chat/completions", json={"model": alias},
+                                           headers={"Authorization": "Bearer test"})
+                    responses = list(pool.map(request, range(2)))
+            self.assertEqual([response.status_code for response in responses], [200, 200])
+            self.assertEqual(peak, 1)
+            self.assertFalse((directory / "active-request.json").exists())
+
+    def test_cached_vision_reader_uses_the_attached_projector(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            (root / "prepared-commit").write_text("revision", encoding="ascii")
+            projector = root / "mmproj.gguf"
+            projector.touch()
+            reader = root / "vision-readers/gpu" / ("strata-vision.exe" if os.name == "nt" else "strata-vision")
+            reader.parent.mkdir(parents=True)
+            reader.touch()
+            serving.write_json(reader.with_name("build.json"), {"revision": "revision"})
+            weights = [root / "model.gguf"]
+            with (
+                patch.dict("sys.modules", {"setup": SimpleNamespace()}),
+                patch.object(serving.sys, "path", serving.sys.path.copy()),
+            ):
+                vision = serving.prepare_vision_reader(root, "gpu", {"projector": str(projector)}, weights)
+            self.assertEqual(vision["mmproj"], str(projector))
+            self.assertEqual(vision["model"], str(weights[0]))
+            self.assertTrue(vision["gpu"])
+            self.assertEqual(vision["max_tokens"], 1024)
+            self.assertIsNone(serving.prepare_vision_reader(root, "off", {}, weights))
+            with self.assertRaisesRegex(ValueError, "projector"):
+                serving.prepare_vision_reader(root, "gpu", {}, weights)
+
+    def test_shared_bot_request_loads_without_a_desktop_selection_and_releases_its_lease(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp).resolve() / "strata-runtime"
+            directory = serving.service_root(root)
+            alias, key = "iq3-profile", "a" * 32
+            serving.write_json(root.parent / "profile-access.json", {"profiles": ["test-bot"]})
+            serving.write_json(directory / "provider.json", {"port": 12345, "key": "test"})
+            serving.write_json(directory / "models.json", {alias: {"profile_id": key}})
+            serving.touch_desktop(root, {"client": "a" * 36, "model": "cloud-model"})
+
+            def launch(_root, selected, intent):
+                self.assertEqual(serving.desktop_choice(root)[0]["alias"], alias)
+                serving.write_json(serving.instance_file(directory, selected["profile_id"]),
+                                   {"model": alias, "intent": intent, "port": 12346, "key": "engine", "pid": 101})
+                return True
+
+            with (
+                patch("uvicorn.Server") as server,
+                patch.object(serving, "Thread"),
+                patch.object(serving, "launch_shared_profile", side_effect=launch) as launch_model,
+                patch.object(serving, "process_for", return_value=object()),
+                patch.object(serving, "online", return_value=True),
+                patch.object(httpx.AsyncClient, "send", return_value=httpx.Response(200, json={"ok": True})),
+            ):
+                serving.serve_bridge(directory)
+                app = server.call_args.args[0].app
+                response = TestClient(app).post("/v1/chat/completions", json={"model": alias},
+                                                headers={"Authorization": "Bearer test"})
+            self.assertEqual(response.status_code, 200)
+            launch_model.assert_called_once()
+            self.assertFalse((directory / "active-request.json").exists())
+            self.assertIsNone(serving.desktop_choice(root)[0])
+
     def test_local_catalog_named_files_use_a_separate_custom_pack(self):
         with TemporaryDirectory() as temp:
             root = Path(temp).resolve()

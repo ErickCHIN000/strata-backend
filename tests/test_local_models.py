@@ -132,3 +132,17 @@ class LocalModelTests(unittest.TestCase):
         library["profiles"] = [{"id": "a" * 32, "name": "Unavailable", "model_id": model["id"]}]
         self.assertEqual(serving.model_roster(library), {})
         self.assertTrue(self.client.post("/runtime/delete-model", json={"id": model["id"]}).json()["ok"])
+
+    def test_image_input_setting_and_existing_vision_overrides_are_preserved(self):
+        model = self.add()["model"]
+        saved = self.client.post("/runtime/save-profile", json={
+            "name": "With images", "model_id": model["id"], "vision_mode": "gpu",
+        }).json()
+        self.assertTrue(saved["ok"], saved)
+        self.assertEqual(saved["profile"]["vision_mode"], "gpu")
+        legacy = self.client.post("/runtime/save-profile", json={
+            "name": "Existing image setup", "model_id": model["id"],
+            "config": {"vision": {"gpu": True, "mmproj": str(self.projector)}},
+        }).json()
+        self.assertTrue(legacy["ok"], legacy)
+        self.assertEqual(legacy["profile"]["vision_mode"], "gpu")

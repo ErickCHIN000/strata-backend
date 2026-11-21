@@ -240,6 +240,7 @@ const advancedFields = {
 function profileDraft(profile = {}) {
   return {
     id: profile.id, name: profile.name ?? '', model_id: profile.model_id ?? '', controls: profile.controls ?? {},
+    vision_mode: profile.vision_mode ?? (profile.config?.vision ? profile.config.vision.gpu ? 'gpu' : 'cpu' : 'off'),
     ...Object.fromEntries(Object.keys(advancedFields).map(name => [
       name, JSON.stringify(profile[name] ?? (name.endsWith('_args') ? [] : {}), null, 2),
     ])),
@@ -356,7 +357,7 @@ function AddLocalModelDialog({ ctx, onClose, onAdded }) {
             options: [['', 'None'], ...catalog.projectors.map(file => [file, file])], onChange: setProjector,
           }),
           catalog && jsx('p', { className: 'text-(--ui-text-secondary)',
-            children: 'The attached projector is saved with the model. Image inference requires a configured Strata vision reader.' }),
+            children: 'Choose GPU or CPU image input in the model profile to prepare the vision reader.' }),
           error && jsx('p', { role: 'alert', children: error }),
           jsxs(DialogFooter, { children: [
             jsx('button', { type: 'button', className: buttonClass, disabled: pending, onClick: onClose, children: 'Cancel' }),
@@ -403,6 +404,7 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
   const savedProfile = profiles.find(profile => profile.id === draft.id)
   const entries = new Map((library?.models ?? []).filter(model => model.available !== false).map(model => [model.id, model.title]))
   const missingModel = draft.model_id && !entries.has(draft.model_id)
+  const model = library?.models?.find(item => item.id === draft.model_id)
 
   function edit(name, value) {
     setDraft(previous => ({ ...previous, [name]: value }))
@@ -454,6 +456,17 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
             options: [['', 'Any model'], ...entries],
           }),
           missingModel && jsx('p', { className: 'text-(--ui-text-secondary)', children: 'This profile keeps its saved model until you choose another option.' }),
+          model?.projector && jsxs('div', { className: 'break-words text-(--ui-text-secondary)',
+            children: [jsx('div', { children: 'Vision projector' }), jsx('div', { children: model.projector })] }),
+          jsx(ThemedSelect, {
+            label: 'Image input', value: draft.vision_mode, disabled: saving || !model?.projector,
+            options: [['off', 'Off'], ['gpu', 'GPU'], ['cpu', 'CPU']],
+            onChange: mode => edit('vision_mode', mode),
+          }),
+          model?.projector && draft.vision_mode !== 'off' && jsx('p', {
+            className: 'text-(--ui-text-secondary)',
+            children: 'The first launch prepares the vision reader. GPU image input uses additional VRAM.',
+          }),
           jsx('div', {
             className: 'grid gap-2 sm:grid-cols-2',
             children: controls.map(control => jsxs('label', {
@@ -541,6 +554,7 @@ function DownloadProgress({ transfer, active, busy, pausing, onPause, onResume }
 }
 
 function startupLabel(row) {
+  if (row?.stage === 'preparing-vision') return 'Preparing vision reader'
   if (row?.stage === 'downloading-mtp') return ['Downloading MTP', row.detail].filter(Boolean).join(' · ')
   if (row?.stage === 'packing-mtp') return 'Packing MTP'
   if (row?.stage === 'packing-model') return 'Packing model'
@@ -562,6 +576,7 @@ function ServingStats({ stats }) {
         children: [
           ['System RAM', memory(stats.ram_used, stats.ram_total)],
           ['GPU VRAM', memory(stats.vram_used, stats.vram_total)],
+          typeof stats.images === 'boolean' && ['Image input', stats.images ? 'Enabled' : 'Off'],
           Number.isFinite(stats.expert_cache_mib) && ['GPU expert cache', `${(stats.expert_cache_mib / 1024).toFixed(1)} GiB`],
           live && ['Live generation', rate(stats.generation_tps)],
           live && ['Live prompt processing', rate(stats.prompt_tps)],
@@ -588,6 +603,63 @@ function ServingStats({ stats }) {
           ] }, index)) }),
         ],
       }),
+    ],
+  })
+}
+
+function ProfileAccess({ ctx, queryScope }) {
+  const access = useQuery({
+    queryKey: [...queryScope, 'strata-profile-access'],
+    queryFn: () => ctx.rest('/runtime/profile-access'), retry: false, refetchInterval: 10_000,
+  })
+  const [changing, setChanging] = useState(null)
+  const lock = useRef(false)
+
+  async function change(profile, enabled) {
+    if (lock.current) return
+    lock.current = true
+    setChanging(profile)
+    try {
+      const result = await ctx.rest('/runtime/profile-access', {
+        method: 'POST', body: { profile, enabled }, timeoutMs: 90_000,
+      })
+      if (!result.ok) throw new Error(result.error || 'Could not update profile access.')
+      await access.refetch()
+    } catch (error) {
+      host.notifyError(error, 'Could not share Strata with this profile')
+    } finally {
+      lock.current = false
+      setChanging(null)
+    }
+  }
+
+  const data = access.data
+  return jsxs('section', {
+    className: sectionClass,
+    children: [
+      jsx('h2', { className: 'font-medium', children: 'Profile access' }),
+      data?.owner && jsx('p', { className: 'text-(--ui-text-secondary)',
+        children: `Shares the backend, downloaded models, and saved model profiles from ${data.owner}.` }),
+      data?.can_manage === false && jsx('p', {
+        children: `Manage access from the ${data.owner} Hermes profile.`,
+      }),
+      data?.profiles && jsx('div', { className: 'flex flex-col gap-2',
+        children: data.profiles.map(profile => jsxs('label', {
+          className: 'flex items-center gap-2',
+          children: [
+            jsx('input', {
+              type: 'checkbox', className: 'accent-(--ui-accent)', checked: profile.enabled,
+              disabled: !data.can_manage || profile.owner || changing !== null,
+              onChange: event => void change(profile.name, event.target.checked),
+            }),
+            jsx('span', { children: profile.label }),
+            profile.owner && jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Owner' }),
+            changing === profile.name && jsx('span', { role: 'status', children: 'Saving…' }),
+          ],
+        }, profile.name)),
+      }),
+      (access.isError || data?.error) && jsx('p', { role: 'alert',
+        children: data?.error ?? 'Could not read local Hermes profiles.' }),
     ],
   })
 }
@@ -930,6 +1002,7 @@ function StrataPage({ ctx }) {
         onSave: () => queryClient.invalidateQueries({ queryKey: libraryKey, exact: true }),
       }, `profiles:${scopeKey}`),
       connected && data && jsx(ServingControls, { ctx, serving }, `serving:${scopeKey}`),
+      connected && data && jsx(ProfileAccess, { ctx, queryScope }, `access:${scopeKey}`),
     ],
   })
 }
@@ -1012,6 +1085,7 @@ function followDesktopModel(ctx) {
   let claimFocus = document.hasFocus()
   let closed = false
   let lastModel = ''
+  let lastProfile = host.state.profile.get()
   let reportedError = ''
   let observedScope = ''
   let observedModel = null
@@ -1019,10 +1093,19 @@ function followDesktopModel(ctx) {
   const sessionModels = new Map()
   const sessionProbes = new Set()
 
-  function send(model, focus, exiting = false) {
+  function selectionScope() {
+    const active = host.state.activeSessionId.get()
+    const sid = host.state.focusedSessionId.get() ?? active
+    const connection = host.state.connectionId.get()
+    const owner = sid !== active ? host.state.focusedSessionOwner.get() : null
+    if (owner && owner.connectionId !== (connection ?? 'local')) return null
+    return { sid, connection, profile: owner?.profile ?? host.state.profile.get(), crossProfile: Boolean(owner) }
+  }
+
+  function send(model, focus, exiting = false, profile = lastProfile) {
     sequence = Math.max(sequence + 1, Date.now() * 1000)
     return ctx.rest('/runtime/desktop-selection', {
-      method: 'POST', body: { client, sequence, model, focus, load, closed: exiting }, timeoutMs: 16_000,
+      method: 'POST', body: { client, sequence, model, focus, load, profile, closed: exiting }, timeoutMs: 16_000,
     })
   }
 
@@ -1031,10 +1114,9 @@ function followDesktopModel(ctx) {
     if (sending) { queued = true; return }
     sending = true
     try {
-      const active = host.state.activeSessionId.get()
-      const sid = host.state.focusedSessionId.get() ?? active
-      const connection = host.state.connectionId.get()
-      const profile = host.state.profile.get()
+      const selected = selectionScope()
+      if (!selected) return
+      const { sid, connection, profile, crossProfile } = selected
       const scope = JSON.stringify([connection, profile, sid])
       if (scope !== observedScope) {
         observedScope = scope
@@ -1043,17 +1125,18 @@ function followDesktopModel(ctx) {
       }
       let model = host.state.model.get()
       if (sid) {
-        const owner = host.state.focusedSessionOwner.get()
-        if (sid !== active && owner && (owner.connectionId !== (connection ?? 'local') || owner.profile !== profile)) return
         // The primary composer paints model picks optimistically. A live chat's
         // session.info is authoritative, including switches that are deferred or rolled back.
         const observed = sessionModels.get(scope)
-        if ((!observed || (sid === active && observed.model !== model)) && !sessionProbes.has(scope)) {
+        if ((!observed || (!crossProfile && observed.model !== model)) && !sessionProbes.has(scope)) {
           // Confirm the session independently so a slow RPC cannot stop the desktop lease.
           sessionProbes.add(scope)
-          void host.request('session.info', { session_id: sid }).then(info => {
-            const focused = host.state.focusedSessionId.get() ?? host.state.activeSessionId.get()
-            if (closed || sid !== focused || connection !== host.state.connectionId.get() || profile !== host.state.profile.get()) return
+          const probe = crossProfile
+            ? host.requestProfile(profile, 'session.info', { session_id: sid })
+            : host.request('session.info', { session_id: sid })
+          void probe.then(info => {
+            const focused = selectionScope()
+            if (closed || !focused || sid !== focused.sid || connection !== focused.connection || profile !== focused.profile) return
             if (sessionModels.get(scope) === observed && typeof info?.model === 'string' && info.model !== observed?.model) {
               sessionModels.set(scope, { model: info.model })
               void refresh()
@@ -1067,9 +1150,10 @@ function followDesktopModel(ctx) {
         observedModel = model
         lastModel = model
       }
+      lastProfile = profile
       const focus = claimFocus
       claimFocus = false
-      const result = await send(model || null, focus)
+      const result = await send(model || null, focus, false, profile)
       if (result?.error && result.error !== reportedError && !result.error.includes('already running')) {
         reportedError = result.error
         host.notifyError(new Error(result.error), 'Could not update the Strata model selection')
@@ -1089,13 +1173,14 @@ function followDesktopModel(ctx) {
 
   const refreshSoon = () => void refresh()
   for (const state of [host.state.model, host.state.gateway, host.state.profile, host.state.connectionId,
-    host.state.activeSessionId, host.state.focusedSessionId]) {
+    host.state.activeSessionId, host.state.focusedSessionId, host.state.focusedSessionOwner]) {
     ctx.onDispose(state.listen(refreshSoon))
   }
   ctx.onEvent('session.info', event => {
     if (event.session_id && typeof event.payload?.model === 'string') {
-      const connection = host.state.connectionId.get()
-      const profile = host.state.profile.get()
+      const focused = selectionScope()
+      if (!focused) return
+      const { connection, profile } = focused
       if (event.profile && event.profile !== profile) return
       sessionModels.set(JSON.stringify([connection, profile, event.session_id]), { model: event.payload.model })
       if (event.session_id === (host.state.focusedSessionId.get() ?? host.state.activeSessionId.get())) refreshSoon()

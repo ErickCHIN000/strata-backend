@@ -23,6 +23,7 @@ PLUGIN_ID = "strata-backend"
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 MODEL_HELPER = Path(__file__).with_name("model_download.py")
 SERVING_HELPER = Path(__file__).with_name("serving.py")
+ACCESS_HELPER = Path(__file__).with_name("profile_access.py")
 STRATA_REPO = "Niko1221/Strata"
 STRATA_ORIGIN = f"https://github.com/{STRATA_REPO}.git"
 STRATA_BRANCH = "main"
@@ -252,7 +253,8 @@ def apply_update():
 
 
 def strata_directory() -> Path:
-    root = plugin_data_dir(PLUGIN_ID).resolve() / "strata-runtime"
+    data = plugin_data_dir(PLUGIN_ID).resolve()
+    root = runpy.run_path(str(ACCESS_HELPER))["runtime_directory"](data)
     if root.resolve() != root or root.is_symlink() or not (not root.exists() or root.is_dir()):
         raise ValueError("The managed Strata folder is not a normal directory.")
     return root
@@ -538,6 +540,37 @@ def serving_tools():
     return runpy.run_path(str(SERVING_HELPER))
 
 
+def profile_access_status():
+    try:
+        return runpy.run_path(str(ACCESS_HELPER))["access_status"](strata_directory())
+    except (OSError, ValueError, ImportError) as exc:
+        return {"error": str(exc) if isinstance(exc, ValueError) else "Could not read Strata profile access."}
+
+
+def set_profile_access(payload):
+    from hermes_cli.plugins_auto_update import plugin_update_lock
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    try:
+        root = strata_directory()
+        access = runpy.run_path(str(ACCESS_HELPER))
+        if not access["access_status"](root)["can_manage"]:
+            raise ValueError("Manage shared profile access from the Strata owner profile.")
+        with plugin_update_lock(root), strata_jobs_lock:
+            if root in strata_jobs:
+                raise ValueError("Wait for the current Strata operation to finish.")
+            tools = serving_tools()
+            roster = tools["model_roster"](model_library())
+            if not roster:
+                raise ValueError("Save a profile linked to a downloaded model before sharing Strata.")
+            tools["configure_provider"](root, roster)
+            return access["change_access"](root, payload, tools, roster)
+    except (ValueError, PluginOperationError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except (OSError, ImportError):
+        return {"ok": False, "error": "Could not update Strata profile access."}
+
+
 def serving_status():
     try:
         root = strata_directory()
@@ -578,6 +611,11 @@ def desktop_selection(payload):
             return {"ok": True}
         tools = serving_tools()
         directory = tools["service_root"](root)
+        access = runpy.run_path(str(ACCESS_HELPER))
+        focused = (payload or {}).get("profile")
+        if focused and focused not in {profile.name for profile in access["provider_profiles"](root)}:
+            tools["touch_desktop"](root, {**payload, "model": "", "load": False})
+            return {"ok": True}
         with strata_jobs_lock:
             if strata_jobs.get(root) == "wipe":
                 return {"ok": True}
@@ -654,6 +692,11 @@ def delete_library_entry(kind, payload):
             roster = tools["model_roster"](library)
             if any(alias == default and item["profile_id"] in affected for alias, item in roster.items()):
                 raise ValueError("Choose a different Hermes default model before deleting this item.")
+            if (root.parent / "profile-access.json").is_file():
+                aliases = {alias for alias, item in roster.items() if item["profile_id"] in affected}
+                users = runpy.run_path(str(ACCESS_HELPER))["defaults_using"](root, aliases)
+                if users:
+                    raise ValueError(f"Choose a different default model for {', '.join(users)} before deleting this item.")
             directory = tools["service_root"](root)
             for row in tools["instance_rows"](root):
                 key = row.get("profile_id")
@@ -800,8 +843,13 @@ def save_model_profile(payload):
                                               or not isinstance(value, str) or "\x00" in value for key, value in env.items())
                 or not isinstance(config, dict)):
             raise ValueError("Environment and config must be JSON objects. Environment values must be strings.")
+        legacy_vision = config.get("vision") if isinstance(config.get("vision"), dict) else {}
+        vision_mode = payload.get("vision_mode", "gpu" if legacy_vision.get("gpu") else "cpu" if legacy_vision else "off")
+        if vision_mode not in ("off", "cpu", "gpu"):
+            raise ValueError("Choose Off, CPU, or GPU for vision.")
         profile = {"id": profile_id, "name": name.strip(), "model_id": selected_model, "controls": controls,
-                   **arguments, "user_args": user_args + arguments["engine_args"], "env": env, "config": config}
+                   **arguments, "user_args": user_args + arguments["engine_args"], "env": env, "config": config,
+                   "vision_mode": vision_mode}
         content = json.dumps(profile, indent=2, allow_nan=False)
         if len(content) > 256_000:
             raise ValueError("This model profile is too large.")
@@ -1001,9 +1049,11 @@ def strata_action(operation: str, payload: dict | None = None):
 
 
 GET_HANDLERS = {"status": strata_status, "latest": strata_latest, "models": strata_models,
-                "library": model_library, "model-options": model_option_reference, "serving": serving_status}
+                "library": model_library, "model-options": model_option_reference, "serving": serving_status,
+                "profile-access": profile_access_status}
 POST_HANDLERS = {action: partial(strata_action, action) for action in ("setup", "update", "wipe", "download")}
 POST_HANDLERS.update({"hf-files": hf_files, "save-profile": save_model_profile,
+                      "profile-access": set_profile_access,
                       "local-model-files": local_model_files, "add-local-model": add_local_model,
                       "delete-model": partial(delete_library_entry, "model"),
                       "delete-profile": partial(delete_library_entry, "profile"),

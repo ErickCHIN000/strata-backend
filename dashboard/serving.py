@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import runpy
 import secrets
 import socket
 import subprocess
@@ -19,7 +20,7 @@ import psutil
 PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
 ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe"}
-PROVIDER_PROTOCOL = 5
+PROVIDER_PROTOCOL = 6
 DESKTOP_LEASE_SECONDS = 65
 
 
@@ -91,6 +92,7 @@ def touch_desktop(root, payload):
     same_model = previous.get("model") == model
     load = payload.get("load") is not False or (same_model and previous.get("load", True) and bool(previous))
     write_json(path, {"model": model, "seen": now, "order": order, "sequence": sequence, "closed": payload.get("closed") is True,
+                      "profile": payload.get("profile"),
                       "load": load,
                       "intent": previous["intent"] if same_model and previous.get("intent") else secrets.token_hex(12)})
 
@@ -100,6 +102,9 @@ def desktop_choice(root, *, include_dormant=False, request_alias=None, requested
     windows = [read_json(path) for path in (directory / "windows").glob("*.json")]
     cutoff = time() - DESKTOP_LEASE_SECONDS
     active = [window for window in windows if not window.get("closed") and window.get("seen", 0) >= cutoff]
+    request = read_json(directory / "active-request.json")
+    if request.get("seen", 0) >= cutoff:
+        active = [request]
     if not active:
         return None, bool(windows)
     choice = max(active, key=lambda window: window.get("order", 0))
@@ -129,7 +134,8 @@ def desktop_choice(root, *, include_dormant=False, request_alias=None, requested
         write_json(directory / "demand.json", {"intent": intent})
         loading = True
     if loading or include_dormant:
-        return {**selected, "alias": alias, "intent": intent, "restarted": intent != selection}, False
+        return {**selected, "alias": alias, "intent": intent, "restarted": intent != selection,
+                "request": choice.get("request", False)}, False
     return None, False
 
 
@@ -213,6 +219,7 @@ def performance_stats(record):
             "ram_used": hardware.get("ram_used"), "ram_total": hardware.get("ram_total"),
             "vram_used": hardware.get("gpu_mem_used"), "vram_total": hardware.get("gpu_mem_total"),
             "expert_cache_mib": metrics["engine"].get("expert_cache_mib"),
+            "images": metrics["engine"].get("images"),
             "recent": recent,
         }
     except (OSError, KeyError, TypeError, ValueError, AttributeError):
@@ -247,7 +254,10 @@ def sync_provider(root, roster):
     directory = service_root(root)
     provider = read_json(directory / "provider.json")
     if provider.get("key"):
-        write_provider_config(provider, roster)
+        access = runpy.run_path(str(Path(__file__).with_name("profile_access.py")))
+        for profile in access["provider_profiles"](root):
+            with access["profile_scope"](profile.name):
+                write_provider_config(provider, roster)
         write_json(directory / "models.json", roster)
 
 
@@ -268,7 +278,8 @@ def configure_provider(root, roster):
             write_json(file, provider)
             write_json(directory / "models.json", roster)
             with (directory / "provider.log").open("ab") as log:
-                process = spawn([sys.executable, "-B", __file__, "bridge", str(directory)], directory, os.environ.copy(), log)
+                env = {**os.environ, "HERMES_HOME": str(root.parent.parent.parent)}
+                process = spawn([sys.executable, "-B", __file__, "bridge", str(directory)], directory, env, log)
             provider.update(process_record(process))
             write_json(file, provider)
             deadline = monotonic() + 10
@@ -331,6 +342,46 @@ def windows_commit_available():
     return None
 
 
+def prepare_vision_reader(root, mode, model, weights):
+    if mode == "off":
+        return None
+    projector = Path(model.get("projector") or "")
+    if not projector.is_absolute() or not projector.is_file():
+        raise ValueError("Attach an existing vision projector to this model before enabling image input.")
+    source = root / "source"
+    sys.path.insert(0, str(source))
+    import setup as strata
+
+    directory = root / "vision-readers" / mode
+    executable = directory / ("strata-vision.exe" if os.name == "nt" else "strata-vision")
+    stamp = directory / "build.json"
+    revision = (root / "prepared-commit").read_text(encoding="ascii").strip()
+    if not executable.is_file() or read_json(stamp).get("revision") != revision:
+        print(f"Preparing the Strata vision reader ({mode}).", flush=True)
+        llama = strata.get_llama_cpp()
+        definitions = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if mode == 'gpu' else 'OFF'}",
+                       "-DSTRATA_PORTABLE=OFF", *strata.host_compiler_defs(mode == "gpu")]
+        vcvars = strata.find_vcvars() if os.name == "nt" else None
+        if mode == "gpu":
+            gpu = strata.gpu_info(0)
+            nvcc, vcvars = strata.install_build_tools(gpu, True)
+            definitions.extend((f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
+                                *strata.toolkit_root_defs(nvcc)))
+        build = source / f"build-plugin-vision-{mode}"
+        strata.cmake_build(source / "tools" / "vision", build, "strata-vision", definitions, vcvars,
+                           f"build-plugin-vision-{mode}.bat" if os.name == "nt" else "")
+        built = build / "bin" / executable.name
+        if not built.is_file():
+            raise ValueError("The vision reader build finished without its executable. Check the activity log.")
+        import shutil
+
+        directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(built, executable)
+        write_json(stamp, {"revision": revision})
+    return {"exe": str(executable), "mmproj": str(projector), "model": str(weights[0]),
+            "gpu": mode == "gpu", "max_tokens": 1024 if mode == "gpu" else 300}
+
+
 def prepare_external_flash_next(root, profile, weights, model=None):
     source = root / "source"
     tools = source / "tools"
@@ -390,9 +441,13 @@ def prepare_external_flash_next(root, profile, weights, model=None):
             raise ValueError("Prepare the shared Flash-Next MTP draft layer before enabling it for this model.")
         args.extend(("--mtp", str(draft)))
     build = read_json(engine.parent / "BUILD.json")
-    return {"exe": str(engine), "cwd": str(source), "tokenizer": str(tokenizer),
-            "log": str(pack / "engine.log"), "drafting": drafting, "args": args,
-            "lib_dirs": build.get("lib_dirs") or build.get("cuda_dirs") or []}
+    config = {"exe": str(engine), "cwd": str(source), "tokenizer": str(tokenizer),
+              "log": str(pack / "engine.log"), "drafting": drafting, "args": args,
+              "lib_dirs": build.get("lib_dirs") or build.get("cuda_dirs") or []}
+    mode = profile.get("vision_mode", "off")
+    if mode != "off":
+        config["vision"] = prepare_vision_reader(root, mode, model or {}, weights)
+    return config
 
 
 def prepare_config(root, profile, model, destination):
@@ -445,7 +500,10 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
     directory = service_root(root)
     key = profile_id(profile["id"])
     record_path = instance_file(directory, key)
-    if process_for(read_json(record_path)):
+    previous = read_json(record_path)
+    if process_for(previous):
+        if intent and previous.get("intent") == intent:
+            return
         raise ValueError("This Strata profile is already running.")
     source = root / "source"
     config_path = directory / "configs" / f"{key}.json"
@@ -455,7 +513,7 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
         if not intent:
             return True
         choice, _ = desktop_choice(root)
-        return bool(choice and choice["intent"] == intent and choice["alias"] == alias)
+        return bool(choice and choice["alias"] == alias and (choice["intent"] == intent or choice.get("request")))
 
     if not current():
         return
@@ -481,7 +539,13 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
 
     config = read_json(config_path)
     engine = config["exe"]
+    vision = config.get("vision")
     config.update(profile.get("config") or {})
+    if "vision_mode" in profile:
+        if vision:
+            config["vision"] = vision
+        else:
+            config.pop("vision", None)
     port, secret = loopback_port(), secrets.token_urlsafe(24)
     config.update(exe=engine, host="127.0.0.1", port=port, api_key=secret, model_name=alias, open_browser=False,
                   user_args=profile.get("user_args", []), env={**(config.get("env") or {}), **profile.get("env", {})})
@@ -525,9 +589,13 @@ def log_tail(path, limit):
 
 def preparation_progress(output):
     for line in reversed(output.splitlines()):
+        if line.startswith("Preparing the Strata vision reader"):
+            return {"stage": "preparing-vision"}
         if line == "Preparing custom Flash-Next pack from the downloaded GGUF shards.":
             return {"stage": "packing-model"}
         if line.lstrip().startswith("> "):
+            if "build-plugin-vision-" in line:
+                return {"stage": "preparing-vision"}
             tool = re.search(r"\bmtp_(fetch|pack|rt)\.py\b", line)
             if tool:
                 return {"stage": "downloading-mtp" if tool[1] == "fetch" else "packing-mtp"}
@@ -642,6 +710,24 @@ def stop_unselected(root, selected):
             stop_process_tree(process, managed=True)
 
 
+def launch_shared_profile(root, selected, intent):
+    from hermes_cli.plugins_auto_update import plugin_update_lock
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    try:
+        with plugin_update_lock(root):
+            instance = read_json(instance_file(service_root(root), selected["profile_id"]))
+            if not process_for(instance):
+                adapter = runpy.run_path(str(Path(__file__).with_name("plugin_api.py")))
+                adapter["runtime"]()["change_strata"](root, "serve", {"id": selected["profile_id"], "intent": intent})
+                error = root / "setup-error.txt"
+                if error.is_file():
+                    raise ValueError(error.read_text(encoding="utf-8"))
+            return True
+    except PluginOperationError:
+        return False
+
+
 def serve_bridge(directory):
     import asyncio
     import httpx
@@ -651,6 +737,7 @@ def serve_bridge(directory):
 
     provider = read_json(directory / "provider.json")
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    requests = asyncio.Lock()
 
     def require_key(request):
         actual = request.headers.get("authorization", "")
@@ -676,13 +763,70 @@ def serve_bridge(directory):
         selected = read_json(directory / "models.json").get(alias)
         if not selected:
             raise HTTPException(404, "Unknown Strata profile. Refresh the Hermes model picker.")
+        root = directory.parent
+        if not read_json(root.parent / "profile-access.json").get("profiles"):
+            return await forward_chat(request, body, alias, selected)
+
+        # One shared engine serves bot requests in order. Its request lease also covers unfocused bots.
+        await requests.acquire()
+        lease = {"model": alias, "intent": secrets.token_hex(12), "seen": time(), "load": True, "request": True}
+        lease_path = directory / "active-request.json"
+        write_json(lease_path, lease)
+
+        async def keep_alive():
+            while True:
+                await asyncio.sleep(10)
+                if await request.is_disconnected():
+                    if read_json(lease_path).get("intent") == lease["intent"]:
+                        lease_path.unlink(missing_ok=True)
+                    return
+                write_json(lease_path, {**lease, "seen": time()})
+
+        heartbeat = asyncio.create_task(keep_alive())
+
+        async def release():
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+            try:
+                if read_json(lease_path).get("intent") == lease["intent"]:
+                    lease_path.unlink(missing_ok=True)
+            finally:
+                requests.release()
+
+        try:
+            response = await forward_chat(request, body, alias, selected, request_intent=lease["intent"])
+        except BaseException:
+            await release()
+            raise
+        upstream = response.body_iterator
+
+        async def response_body():
+            try:
+                async for chunk in upstream:
+                    yield chunk
+            finally:
+                await release()
+
+        response.body_iterator = response_body()
+        return response
+
+    async def forward_chat(request, body, alias, selected, request_intent=None):
         deadline = monotonic() + 480
         # Session confirmation and the desktop heartbeat can arrive after the first prompt.
         selection_grace = monotonic() + DESKTOP_LEASE_SECONDS
         requested_at = time()
         selected_intent = None
         root = directory.parent
+        launched = request_intent is None
         while True:
+            if not launched:
+                try:
+                    launched = await asyncio.to_thread(launch_shared_profile, root, selected, request_intent)
+                except (ValueError, OSError) as exc:
+                    raise HTTPException(503, str(exc) if isinstance(exc, ValueError) else "Could not start the shared Strata profile.") from None
             instance = read_json(instance_file(directory, selected["profile_id"]))
             tracked = (directory / "windows").is_dir()
             choice, _ = desktop_choice(root, request_alias=alias if selected_intent is None else None,
@@ -738,7 +882,8 @@ def serve_bridge(directory):
                 windows = directory / "windows"
                 if windows.is_dir() or monotonic() - started >= DESKTOP_LEASE_SECONDS:
                     stop_unselected(root, selected)
-                    if closed or not windows.is_dir():
+                    shared = bool(read_json(root.parent / "profile-access.json").get("profiles"))
+                    if (closed or not windows.is_dir()) and not shared and not (selected or {}).get("request"):
                         server.should_exit = True
                         return
             except (OSError, ValueError, psutil.Error) as exc:

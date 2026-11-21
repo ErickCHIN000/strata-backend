@@ -27,7 +27,9 @@ The **Use SC117 Flash-Next IQ3_S** shortcut fills the model repository and quant
 
 **Model profiles** save common memory and context settings, raw Strata engine, launch, setup and server arguments, environment variables, and run config overrides. The option reference comes from the installed build. The Model picker lists completed downloads, and **Any model** creates a reusable preset. Fresh wipe preserves profiles and the shared Hugging Face cache.
 
-For files downloaded with `hf download --local-dir`, click **Add Model** under **Models**, enter the full folder or GGUF path, then **Scan folder**. Choose the complete shard set, optionally attach an `mmproj` GGUF found in that folder, and click **Add Model**. For example, scan `F:\Models\Huihui-Flash-Next-v2` and choose the two files under `swift-IQ3_S`. The entry uses the existing files and appears in the profile’s Model dropdown. A projector is recorded with the model; image inference requires a configured Strata vision reader. Complete downloads are required. Add the same model again to update its display name or projector.
+For files downloaded with `hf download --local-dir`, click **Add Model** under **Models**, enter the full folder or GGUF path, then **Scan folder**. Choose the complete shard set, optionally attach an `mmproj` GGUF found in that folder, and click **Add Model**. For example, scan `F:\Models\Huihui-Flash-Next-v2` and choose the two files under `swift-IQ3_S`. The entry uses the existing files and appears in the profile’s Model dropdown. Complete downloads are required. Add the same model again to update its display name or projector.
+
+The profile form displays the attached projector path. Choose **GPU** or **CPU** under **Image input**, save the profile, and load it to prepare the vision reader. Its first build uses Strata’s existing compiler setup and can take several minutes. GPU image input uses additional VRAM. **Off** serves text only.
 
 Use **Delete model** under **Models** to remove a managed download. Locally added files have **Remove model**, which removes their library registration and keeps the original files in place. Use **Delete profile** under **Model profiles** to remove the selected preset. These actions ask for confirmation. Stop a running profile and switch the Hermes default away from it before deleting it or its download.
 
@@ -38,6 +40,12 @@ Use **Delete model** under **Models** to remove a managed download. Locally adde
 3. The plugin follows confirmed switches in live sessions. Selecting another Strata profile unloads the previous one. Choosing a cloud model unloads the model and keeps the lightweight provider available for later selection. Closing the final Desktop window releases both. If the close signal is interrupted, the backend cleans up after the last heartbeat expires.
 
 **Strata processes** lists managed instances and detected external Strata engines or servers. Running managed profiles show live timing when available, the three most recent requests, and current system RAM and GPU VRAM usage. **Stop process** unloads the selected managed model. Send a new message to the same profile or select it again to load it with its latest saved settings. Automatic unloading applies to plugin-managed instances. Separate-engine and ready-pack formats need their own serving setup.
+
+## Share Strata with other bots
+
+Open **Profile access** in the Strata tab of the profile that owns the installation. Check each local Hermes bot/profile that should use it. Hermes enables a small connector in that profile and registers the same Strata provider and saved model presets. The common installation supplies the Python environment, model files, native packs, and model profiles. New and edited presets refresh the enabled profiles’ provider lists.
+
+Other bots can select a Strata preset in their model pickers and send messages to load it. Shared bot requests run in order on the same engine, including when another bot is focused. Closing Desktop unloads idle model instances; the lightweight shared provider remains available to enabled bots. Remove a bot’s access with its checkbox after choosing a different default model for that bot.
 
 On upgrading from v0.2.2 or earlier, use the **Restart gateway** button in the Strata tab to activate the new Python router once. Updates to the plugin's runtime handlers are then picked up on the next request through that router.
 
