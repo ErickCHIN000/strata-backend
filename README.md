@@ -45,7 +45,7 @@ Use **Delete model** under **Models** to remove a managed download. Locally adde
 
 Open **Profile access** in the Strata tab of the profile that owns the installation. Check each local Hermes bot/profile that should use it. Hermes enables a small connector in that profile and registers the same Strata provider and saved model presets. The common installation supplies the Python environment, model files, native packs, and model profiles. New and edited presets refresh the enabled profiles’ provider lists.
 
-Other bots can select a Strata preset in their model pickers and send messages to load it. Shared bot requests run in order on the same engine, including when another bot is focused. Closing Desktop unloads idle model instances; the lightweight shared provider remains available to enabled bots. Remove a bot’s access with its checkbox after choosing a different default model for that bot.
+Other bots can select a Strata preset in their model pickers and send messages to load it. Shared bot requests run in order on the same engine, including when another bot is focused. The model stays loaded between replies. Explicit Stop, switching models, and closing the last Desktop window still release the selected model. The lightweight shared provider remains available to enabled bots. Remove a bot’s access with its checkbox after choosing a different default model for that bot.
 
 On upgrading from v0.2.2 or earlier, use the **Restart gateway** button in the Strata tab to activate the new Python router once. Updates to the plugin's runtime handlers are then picked up on the next request through that router.
 

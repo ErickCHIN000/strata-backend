@@ -21,6 +21,7 @@ PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
 ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe"}
 PROVIDER_PROTOCOL = 6
+PROVIDER_REVISION = 7
 DESKTOP_LEASE_SECONDS = 65
 
 
@@ -95,19 +96,54 @@ def touch_desktop(root, payload):
                       "profile": payload.get("session_profile", payload.get("profile")),
                       "load": load,
                       "intent": previous["intent"] if same_model and previous.get("intent") else secrets.token_hex(12)})
+    if payload.get("closed") is True and desktop_window_choice(service_root(root))[0] is None:
+        (service_root(root) / "warm-request.json").unlink(missing_ok=True)
+
+
+def desktop_window_choice(directory):
+    windows = [read_json(path) for path in (directory / "windows").glob("*.json")]
+    cutoff = time() - DESKTOP_LEASE_SECONDS
+    active = [window for window in windows if not window.get("closed") and window.get("seen", 0) >= cutoff]
+    return max(active, key=lambda window: window.get("order", 0)) if active else None, bool(windows)
+
+
+def retain_shared_model(root, lease):
+    directory = service_root(root)
+    if read_json(directory / "hold.json").get("intent") == lease["intent"]:
+        return
+    window, _ = desktop_window_choice(directory)
+    previous = lease.get("desktop")
+    if window and window["model"] == lease["model"]:
+        write_json(directory / "demand.json", {"selection": window["intent"], "intent": lease["intent"]})
+    elif window:
+        if not previous or (window["intent"], window.get("order")) != (previous["intent"], previous.get("order")):
+            return
+    elif previous:
+        return
+    write_json(directory / "warm-request.json",
+               {"model": lease["model"], "intent": lease["intent"], "load": True, "desktop": window})
 
 
 def desktop_choice(root, *, include_dormant=False, request_alias=None, requested_at=0):
     directory = service_root(root)
-    windows = [read_json(path) for path in (directory / "windows").glob("*.json")]
-    cutoff = time() - DESKTOP_LEASE_SECONDS
-    active = [window for window in windows if not window.get("closed") and window.get("seen", 0) >= cutoff]
+    window, tracked = desktop_window_choice(directory)
+    choice = window
+    warm = read_json(directory / "warm-request.json")
+    warm_selected = False
     request = read_json(directory / "active-request.json")
-    if request.get("seen", 0) >= cutoff:
-        active = [request]
-    if not active:
-        return None, bool(windows)
-    choice = max(active, key=lambda window: window.get("order", 0))
+    if request.get("seen", 0) >= time() - DESKTOP_LEASE_SECONDS:
+        choice = request
+    elif warm:
+        previous = warm.get("desktop")
+        if window and window["model"] == warm["model"]:
+            warm_selected = True
+        elif (window and previous and (window["intent"], window.get("order")) == (previous["intent"], previous.get("order"))
+              or not window and not previous):
+            choice = warm
+        else:
+            (directory / "warm-request.json").unlink(missing_ok=True)
+    if not choice:
+        return None, tracked
     roster = read_json(directory / "models.json")
     alias = choice["model"]
     selected = roster.get(alias)
@@ -129,7 +165,7 @@ def desktop_choice(root, *, include_dormant=False, request_alias=None, requested
         intent = restart
         demand = {"selection": selection, "intent": intent}
         write_json(directory / "demand.json", demand)
-    loading = choice.get("load", True) or demand.get("intent") == intent
+    loading = choice.get("load", True) or demand.get("intent") == intent or warm_selected
     if not loading and request_alias == alias:
         write_json(directory / "demand.json", {"intent": intent})
         loading = True
@@ -270,11 +306,12 @@ def configure_provider(root, roster):
     process = None
     try:
         old_process = process_for(provider)
-        if old_process is not None and provider.get("protocol") != PROVIDER_PROTOCOL:
+        if old_process is not None and (provider.get("protocol") != PROVIDER_PROTOCOL
+                                        or (provider.get("revision") or 0) < PROVIDER_REVISION):
             stop_process_tree(old_process, managed=True)
         if process_for(provider) is None:
             provider = {"port": loopback_port(provider.get("port", 0)), "key": provider.get("key") or secrets.token_urlsafe(32),
-                        "protocol": PROVIDER_PROTOCOL}
+                        "protocol": PROVIDER_PROTOCOL, "revision": PROVIDER_REVISION}
             write_json(file, provider)
             write_json(directory / "models.json", roster)
             with (directory / "provider.log").open("ab") as log:
@@ -769,7 +806,9 @@ def serve_bridge(directory):
 
         # One shared engine serves bot requests in order. Its request lease also covers unfocused bots.
         await requests.acquire()
-        lease = {"model": alias, "intent": secrets.token_hex(12), "seen": time(), "load": True, "request": True}
+        window, _ = desktop_window_choice(directory)
+        lease = {"model": alias, "intent": secrets.token_hex(12), "seen": time(), "load": True, "request": True,
+                 "desktop": window}
         lease_path = directory / "active-request.json"
         write_json(lease_path, lease)
 
@@ -784,7 +823,7 @@ def serve_bridge(directory):
 
         heartbeat = asyncio.create_task(keep_alive())
 
-        async def release():
+        async def release(keep_loaded=False):
             heartbeat.cancel()
             try:
                 await heartbeat
@@ -792,6 +831,8 @@ def serve_bridge(directory):
                 pass
             try:
                 if read_json(lease_path).get("intent") == lease["intent"]:
+                    if keep_loaded:
+                        retain_shared_model(root, lease)
                     lease_path.unlink(missing_ok=True)
             finally:
                 requests.release()
@@ -804,11 +845,13 @@ def serve_bridge(directory):
         upstream = response.body_iterator
 
         async def response_body():
+            completed = False
             try:
                 async for chunk in upstream:
                     yield chunk
+                completed = response.status_code < 400
             finally:
-                await release()
+                await release(keep_loaded=completed)
 
         response.body_iterator = response_body()
         return response

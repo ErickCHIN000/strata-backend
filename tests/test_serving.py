@@ -16,6 +16,94 @@ from dashboard import serving
 
 
 class ServingTests(unittest.TestCase):
+    def test_newer_provider_revision_is_reused_by_a_compatible_caller(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            serving.write_json(serving.service_root(root) / "provider.json",
+                               {"protocol": serving.PROVIDER_PROTOCOL, "revision": serving.PROVIDER_REVISION + 1,
+                                "pid": 101, "port": 12345, "key": "test"})
+            with (
+                patch.object(serving, "process_for", return_value=object()),
+                patch.object(serving, "online", return_value=True),
+                patch.object(serving, "sync_provider"),
+                patch.object(serving, "spawn") as spawn,
+                patch.object(serving, "stop_process_tree") as stop,
+            ):
+                self.assertTrue(serving.configure_provider(root, {"iq3": {"profile_id": "a" * 32}})["ok"])
+                spawn.assert_not_called()
+                stop.assert_not_called()
+
+    def test_two_shared_replies_keep_a_restored_selection_loaded_until_desktop_closes(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp).resolve() / "strata-runtime"
+            directory = serving.service_root(root)
+            alias, key, client_id = "iq3-profile", "a" * 32, "a" * 36
+            serving.write_json(root.parent / "profile-access.json", {"profiles": ["bot"]})
+            serving.write_json(directory / "provider.json", {"port": 12345, "key": "test"})
+            serving.write_json(directory / "models.json", {alias: {"profile_id": key}})
+            serving.touch_desktop(root, {"client": client_id, "model": alias, "load": False})
+            self.assertIsNone(serving.desktop_choice(root)[0])
+            starts = 0
+
+            def launch(_root, selected, intent):
+                nonlocal starts
+                instance = serving.instance_file(directory, key)
+                if not instance.exists():
+                    starts += 1
+                    serving.write_json(instance, {"profile_id": key, "model": alias, "intent": intent,
+                                                  "port": 12346, "key": "engine", "pid": 101})
+                return True
+
+            def process_for(record):
+                return SimpleNamespace(pid=101) if record.get("pid") == 101 else None
+
+            with (
+                patch("uvicorn.Server") as server,
+                patch.object(serving, "Thread"),
+                patch.object(serving, "launch_shared_profile", side_effect=launch),
+                patch.object(serving, "process_for", side_effect=process_for),
+                patch.object(serving, "stop_process_tree") as stop,
+                patch.object(serving, "online", return_value=True),
+                patch.object(httpx.AsyncClient, "send", return_value=httpx.Response(200, json={"ok": True})),
+            ):
+                serving.serve_bridge(directory)
+                app = server.call_args.args[0].app
+                with TestClient(app) as client:
+                    for _ in range(2):
+                        response = client.post("/v1/chat/completions", json={"model": alias},
+                                               headers={"Authorization": "Bearer test"})
+                        self.assertEqual(response.status_code, 200)
+                        selected, _ = serving.desktop_choice(root)
+                        self.assertEqual(selected["alias"], alias)
+                        serving.stop_unselected(root, selected)
+                        stop.assert_not_called()
+                self.assertEqual(starts, 1)
+                serving.touch_desktop(root, {"client": client_id, "model": alias, "closed": True})
+                serving.stop_unselected(root, serving.desktop_choice(root)[0])
+                stop.assert_called_once()
+                serving.touch_desktop(root, {"client": "b" * 36, "model": alias, "load": False})
+                self.assertIsNone(serving.desktop_choice(root)[0])
+
+    def test_manual_stop_and_cloud_switch_override_a_retained_shared_model(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp).resolve() / "strata-runtime"
+            directory = serving.service_root(root)
+            alias, client_id = "iq3", "a" * 36
+            serving.write_json(directory / "models.json", {alias: {"profile_id": "a" * 32}})
+            serving.touch_desktop(root, {"client": client_id, "model": alias, "load": False})
+            window, _ = serving.desktop_window_choice(directory)
+            lease = {"model": alias, "intent": "reply", "desktop": window}
+            serving.retain_shared_model(root, lease)
+            choice = serving.desktop_choice(root)[0]
+            serving.hold_desktop_choice(root, choice["intent"], manual_stop=True)
+            serving.touch_desktop(root, {"client": client_id, "model": alias, "load": False})
+            self.assertIsNone(serving.desktop_choice(root)[0])
+            serving.retain_shared_model(root, {**lease, "intent": "new-reply"})
+            self.assertEqual(serving.desktop_choice(root)[0]["alias"], alias)
+            serving.touch_desktop(root, {"client": client_id, "model": "cloud"})
+            self.assertIsNone(serving.desktop_choice(root)[0])
+            self.assertFalse((directory / "warm-request.json").exists())
+
     def test_shared_bot_requests_are_served_in_order(self):
         with TemporaryDirectory() as temp:
             root = Path(temp).resolve() / "strata-runtime"
@@ -116,6 +204,8 @@ class ServingTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             launch_model.assert_called_once()
             self.assertFalse((directory / "active-request.json").exists())
+            self.assertEqual(serving.desktop_choice(root)[0]["alias"], alias)
+            serving.touch_desktop(root, {"client": "a" * 36, "model": "different-cloud-model"})
             self.assertIsNone(serving.desktop_choice(root)[0])
 
     def test_local_catalog_named_files_use_a_separate_custom_pack(self):

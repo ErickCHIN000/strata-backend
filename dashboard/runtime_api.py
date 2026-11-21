@@ -626,7 +626,8 @@ def desktop_selection(payload):
             return {"ok": True}
 
         provider = tools["read_json"](directory / "provider.json")
-        if provider.get("protocol") != tools["PROVIDER_PROTOCOL"] or not tools["process_for"](provider):
+        if (provider.get("protocol") != tools["PROVIDER_PROTOCOL"]
+                or (provider.get("revision") or 0) < tools["PROVIDER_REVISION"] or not tools["process_for"](provider)):
             with plugin_update_lock(root):
                 roster = tools["model_roster"](model_library())
                 if not roster:
