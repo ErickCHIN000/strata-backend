@@ -107,6 +107,30 @@ class ProfileAccessTests(unittest.TestCase):
         with profile_access.profile_scope("test-bot"):
             self.assertEqual(profile_access.runtime_directory(profile_access.data_directory(self.bot)), self.root)
 
+    def test_sharing_route_publishes_access_before_starting_an_idle_provider(self):
+        model = self.root / "models/shared-model"
+        model.mkdir(parents=True)
+        (model / "weights.gguf").write_bytes(b"fixture")
+        serving.write_json(model / "model.json", {"id": "shared", "title": "Shared", "files": ["weights.gguf"]})
+        serving.write_json(self.root.parent / "model-profiles" / ("a" * 32 + ".json"),
+                           {"id": "a" * 32, "name": "Shared", "model_id": "shared"})
+        adapter = runpy.run_path("dashboard/plugin_api.py")
+        runtime = adapter["runtime"]()
+
+        def configure(root, roster):
+            self.assertIn("test-bot", profile_access.read_state(root.parent / "profile-access.json")["profiles"])
+            self.assertEqual(profile_access.read_state(profile_access.data_directory(self.bot) / "shared-runtime.json"),
+                             {"owner": "default"})
+            return {"ok": True}
+
+        with patch.dict(runtime["set_profile_access"].__globals__,
+                        {"serving_tools": lambda: {**vars(serving), "configure_provider": configure}}):
+            app = FastAPI()
+            app.include_router(adapter["router"])
+            result = TestClient(app).post("/runtime/profile-access",
+                                         json={"target_profile": "test-bot", "enabled": True}).json()
+        self.assertTrue(result["ok"], result)
+
     def test_shared_presets_refresh_every_exposed_profile(self):
         self.change(True)
         serving.sync_provider(self.root, {"updated-profile": {"profile_id": "b" * 32, "context_length": 131072}})

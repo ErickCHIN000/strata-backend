@@ -563,8 +563,10 @@ def set_profile_access(payload):
             roster = tools["model_roster"](model_library())
             if not roster:
                 raise ValueError("Save a profile linked to a downloaded model before sharing Strata.")
-            tools["configure_provider"](root, roster)
-            return access["change_access"](root, payload, tools, roster)
+            result = access["change_access"](root, payload, tools, roster)
+            if (payload or {}).get("enabled") is True:
+                tools["configure_provider"](root, roster)
+            return result
     except (ValueError, PluginOperationError) as exc:
         return {"ok": False, "error": str(exc)}
     except (OSError, ImportError):
