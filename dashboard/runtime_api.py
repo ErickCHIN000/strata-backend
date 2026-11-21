@@ -612,7 +612,7 @@ def desktop_selection(payload):
         tools = serving_tools()
         directory = tools["service_root"](root)
         access = runpy.run_path(str(ACCESS_HELPER))
-        focused = (payload or {}).get("profile")
+        focused = (payload or {}).get("session_profile", (payload or {}).get("profile"))
         if focused and focused not in {profile.name for profile in access["provider_profiles"](root)}:
             tools["touch_desktop"](root, {**payload, "model": "", "load": False})
             return {"ok": True}

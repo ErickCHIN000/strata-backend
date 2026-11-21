@@ -621,7 +621,7 @@ function ProfileAccess({ ctx, queryScope }) {
     setChanging(profile)
     try {
       const result = await ctx.rest('/runtime/profile-access', {
-        method: 'POST', body: { profile, enabled }, timeoutMs: 90_000,
+        method: 'POST', body: { target_profile: profile, enabled }, timeoutMs: 90_000,
       })
       if (!result.ok) throw new Error(result.error || 'Could not update profile access.')
       await access.refetch()
@@ -1105,7 +1105,7 @@ function followDesktopModel(ctx) {
   function send(model, focus, exiting = false, profile = lastProfile) {
     sequence = Math.max(sequence + 1, Date.now() * 1000)
     return ctx.rest('/runtime/desktop-selection', {
-      method: 'POST', body: { client, sequence, model, focus, load, profile, closed: exiting }, timeoutMs: 16_000,
+      method: 'POST', body: { client, sequence, model, focus, load, session_profile: profile, closed: exiting }, timeoutMs: 16_000,
     })
   }
 

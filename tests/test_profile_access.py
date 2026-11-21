@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import runpy
 import unittest
@@ -7,6 +9,7 @@ from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 from dashboard import profile_access, serving
@@ -31,7 +34,24 @@ class ProfileAccessTests(unittest.TestCase):
         self.enable = self.enterContext(patch("hermes_cli.plugins_cmd.dashboard_set_agent_plugin_enabled", return_value={"ok": True}))
 
     def change(self, enabled):
-        return profile_access.change_access(self.root, {"profile": "test-bot", "enabled": enabled}, vars(serving), self.roster)
+        return profile_access.change_access(self.root, {"target_profile": "test-bot", "enabled": enabled}, vars(serving), self.roster)
+
+    def test_native_guard_accepts_plugin_profile_settings_without_changing_request_scope(self):
+        from hermes_cli.dashboard_auth.native_http import _check_profile_scope
+
+        async def check(path, payload):
+            async def receive():
+                return {"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}
+
+            request = Request({"type": "http", "method": "POST", "path": path,
+                               "query_string": b"", "headers": [(b"content-type", b"application/json")]}, receive)
+            await _check_profile_scope(request, str(self.home))
+
+        base = "/api/plugins/strata-backend/runtime/"
+        with self.assertRaisesRegex(PermissionError, "profile_scope_mismatch"):
+            asyncio.run(check(base + "profile-access", {"profile": "test-bot", "enabled": True}))
+        asyncio.run(check(base + "profile-access", {"target_profile": "test-bot", "enabled": True}))
+        asyncio.run(check(base + "desktop-selection", {"session_profile": "test-bot", "model": "iq3-saved"}))
 
     def test_bot_uses_owner_runtime_and_shared_provider_without_copying_files(self):
         self.assertTrue(self.change(True)["ok"])
@@ -124,5 +144,5 @@ class ProfileAccessTests(unittest.TestCase):
             status = client.get("/runtime/profile-access").raise_for_status().json()
             self.assertEqual(status["owner"], "default")
             self.assertEqual(status["current"], "test-bot")
-            result = client.post("/runtime/profile-access", json={"profile": "default", "enabled": False}).json()
+            result = client.post("/runtime/profile-access", json={"target_profile": "default", "enabled": False}).json()
             self.assertIn("owner profile", result["error"])

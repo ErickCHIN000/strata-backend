@@ -131,7 +131,8 @@ def change_access(root, payload, tools, roster):
     status = access_status(root)
     if not status["can_manage"]:
         raise ValueError("Manage shared profile access from the Strata owner profile.")
-    name, enabled = (payload or {}).get("profile"), (payload or {}).get("enabled")
+    name = (payload or {}).get("target_profile", (payload or {}).get("profile"))
+    enabled = (payload or {}).get("enabled")
     target = next((profile for profile in known_profiles() if profile.name == name), None)
     if target is None or name == status["owner"] or not isinstance(enabled, bool):
         raise ValueError("Choose another local Hermes profile and whether to enable access.")

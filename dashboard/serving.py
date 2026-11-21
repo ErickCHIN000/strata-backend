@@ -92,7 +92,7 @@ def touch_desktop(root, payload):
     same_model = previous.get("model") == model
     load = payload.get("load") is not False or (same_model and previous.get("load", True) and bool(previous))
     write_json(path, {"model": model, "seen": now, "order": order, "sequence": sequence, "closed": payload.get("closed") is True,
-                      "profile": payload.get("profile"),
+                      "profile": payload.get("session_profile", payload.get("profile")),
                       "load": load,
                       "intent": previous["intent"] if same_model and previous.get("intent") else secrets.token_hex(12)})
 
