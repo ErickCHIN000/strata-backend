@@ -93,6 +93,20 @@ class ProfileAccessTests(unittest.TestCase):
         with profile_access.profile_scope("test-bot"), self.assertRaisesRegex(ValueError, "no longer has access"):
             profile_access.runtime_directory(data)
 
+    def test_existing_plugin_without_backend_data_is_reused(self):
+        plugin = self.bot / "plugins" / "strata-backend"
+        (plugin / "dashboard").mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text("name: strata-backend\nversion: 0.5.3\n", encoding="utf-8")
+        (plugin / "dashboard/profile_access.py").write_text("def runtime_directory(data):\n    pass\n", encoding="utf-8")
+        (plugin / "user-notes.txt").write_text("Keep this plugin checkout", encoding="utf-8")
+        before = {path.relative_to(plugin): path.read_bytes() for path in plugin.rglob("*") if path.is_file()}
+        self.assertTrue(self.change(True)["ok"])
+        after = {path.relative_to(plugin): path.read_bytes() for path in plugin.rglob("*") if path.is_file()}
+        self.assertEqual(after, before)
+        self.assertFalse((profile_access.data_directory(self.bot) / "strata-runtime").exists())
+        with profile_access.profile_scope("test-bot"):
+            self.assertEqual(profile_access.runtime_directory(profile_access.data_directory(self.bot)), self.root)
+
     def test_shared_presets_refresh_every_exposed_profile(self):
         self.change(True)
         serving.sync_provider(self.root, {"updated-profile": {"profile_id": "b" * 32, "context_length": 131072}})

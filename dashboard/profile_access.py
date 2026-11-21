@@ -103,9 +103,14 @@ def ensure_connector(home, owner):
         raise ValueError("The target profile's plugin folder moved outside its Hermes home.")
     marker = target / "shared-strata.json"
     if target.exists():
-        if read_state(marker).get("owner") != owner:
-            raise ValueError("This profile already has a separate Strata plugin copy. Remove that copy before linking the shared installation.")
-        return
+        if marker.is_file():
+            if read_state(marker).get("owner") != owner:
+                raise ValueError("This profile is already linked to another Strata installation.")
+            return
+        manifest = YAML(typ="safe").load((target / "plugin.yaml").read_text(encoding="utf-8"))
+        if isinstance(manifest, dict) and manifest.get("name") == "strata-backend" and (target / "dashboard" / "profile_access.py").is_file():
+            return
+        raise ValueError("Update this profile's Strata plugin to a version with profile sharing, then enable access.")
     code = Path(__file__).resolve().parents[1]
     manifest = YAML(typ="safe").load((code / "plugin.yaml").read_text(encoding="utf-8"))
     directory.mkdir(parents=True, exist_ok=True)
