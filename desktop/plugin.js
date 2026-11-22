@@ -405,6 +405,7 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
   const entries = new Map((library?.models ?? []).filter(model => model.available !== false).map(model => [model.id, model.title]))
   const missingModel = draft.model_id && !entries.has(draft.model_id)
   const model = library?.models?.find(item => item.id === draft.model_id)
+  const inkling = model?.family === 'inkling-2-mini'
 
   function edit(name, value) {
     setDraft(previous => ({ ...previous, [name]: value }))
@@ -419,7 +420,10 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
     try {
       const advanced = Object.fromEntries(Object.keys(advancedFields).map(name => [name, JSON.parse(draft[name])]))
       const result = await ctx.rest('/runtime/save-profile', {
-        method: 'POST', body: { ...draft, model_id: draft.model_id || null, ...advanced },
+        method: 'POST', body: {
+          ...draft, model_id: draft.model_id || null, ...advanced,
+          controls: inkling ? Object.fromEntries(Object.entries(draft.controls).filter(([flag]) => flag === '--max-context')) : draft.controls,
+        },
       })
       if (!result.ok) throw new Error(result.error || 'Could not save the profile.')
       setDraft(profileDraft(result.profile))
@@ -457,19 +461,19 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
           }),
           missingModel && jsx('p', { className: 'text-(--ui-text-secondary)', children: 'This profile keeps its saved model until you choose another option.' }),
           model?.projector && jsxs('div', { className: 'break-words text-(--ui-text-secondary)',
-            children: [jsx('div', { children: 'Vision projector' }), jsx('div', { children: model.projector })] }),
+            children: [jsx('div', { children: model.format === 'strata' ? 'Vision pack' : 'Vision projector' }), jsx('div', { children: model.projector })] }),
           jsx(ThemedSelect, {
             label: 'Image input', value: draft.vision_mode, disabled: saving || !model?.projector,
-            options: [['off', 'Off'], ['gpu', 'GPU'], ['cpu', 'CPU']],
+            options: inkling ? [['off', 'Off'], ['gpu', 'On (native vision)']] : [['off', 'Off'], ['gpu', 'GPU'], ['cpu', 'CPU']],
             onChange: mode => edit('vision_mode', mode),
           }),
           model?.projector && draft.vision_mode !== 'off' && jsx('p', {
             className: 'text-(--ui-text-secondary)',
-            children: 'The first launch prepares the vision reader. GPU image input uses additional VRAM.',
+            children: inkling ? 'Inkling reads images with its native vision pack.' : 'The first launch prepares the vision reader. GPU image input uses additional VRAM.',
           }),
           jsx('div', {
             className: 'grid gap-2 sm:grid-cols-2',
-            children: controls.map(control => jsxs('label', {
+            children: controls.filter(control => !inkling || control.flag === '--max-context').map(control => jsxs('label', {
               children: [control.label, jsx('input', {
                 className: inputClass, type: 'number', min: control.min, step: control.step, placeholder: 'Strata default',
                 value: draft.controls[control.flag] ?? '', disabled: saving,
@@ -881,13 +885,15 @@ function StrataPage({ ctx }) {
         children: [
           jsx('dt', { children: 'Installed commit' }),
           jsx('dd', { children: data.revision?.slice(0, 7) ?? '—' }),
-          jsx('dt', { children: 'GitHub main' }),
+          jsx('dt', { children: data.release ?? 'Strata release' }),
           jsx('dd', { children: latestRevision?.slice(0, 7) ?? (latest.isFetching ? 'Checking…' : 'Unavailable') }),
+          data.engine_version && jsx('dt', { children: 'Native engine' }),
+          data.engine_version && jsx('dd', { children: data.engine_version }),
         ],
       }),
       data && !data.ready && !pending && jsx('p', {
         className: 'text-(--ui-text-secondary)',
-        children: 'Setup builds the Strata engine and installs its Python dependencies in a private virtual environment. Model selection is separate.',
+        children: 'Setup prepares the Strata engine and its private Python environment. Models are selected separately.',
       }),
       jsxs('div', {
         className: 'flex flex-wrap items-center gap-2',
@@ -971,7 +977,7 @@ function StrataPage({ ctx }) {
                     className: 'text-(--ui-text-secondary)',
                     children: [model.directory ?? model.repo, downloadSize(model.bytes),
                       model.available === false && 'Local files missing',
-                      model.projector && 'Vision projector attached'].filter(Boolean).join(' · '),
+                      model.projector && (model.format === 'strata' ? 'Vision pack attached' : 'Vision projector attached')].filter(Boolean).join(' · '),
                   }),
                 ] }),
                 jsx('button', {

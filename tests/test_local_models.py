@@ -43,7 +43,7 @@ class LocalModelTests(unittest.TestCase):
         from hermes_constants import get_hermes_home
 
         installed = get_hermes_home() / "plugin-data/strata-backend/strata-runtime"
-        reader = installed / "source/tools/gguf_reader.py"
+        reader = model_download.terminal_directory(installed) / "tools/gguf_reader.py"
         python = installed / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         if not reader.is_file() or not python.is_file():
             self.skipTest("Set up the managed Strata runtime for local GGUF integration tests.")

@@ -19,10 +19,12 @@ import psutil
 
 PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
-ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe"}
+ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe", "strata-inkling", "strata-inkling.exe"}
 PROVIDER_PROTOCOL = 6
-PROVIDER_REVISION = 7
+PROVIDER_REVISION = 8
 DESKTOP_LEASE_SECONDS = 65
+paths = runpy.run_path(str(Path(__file__).with_name("runtime_paths.py")))
+terminal_directory, engine_sources = paths["terminal_directory"], paths["engine_sources"]
 
 
 def read_json(path):
@@ -236,7 +238,7 @@ def performance_stats(record):
                           headers={"Authorization": f"Bearer {record['key']}", "Accept": "application/json"})
         with urlopen(request, timeout=0.6) as response:
             metrics = json.load(response)
-        if metrics["engine"]["model"] != record["model"]:
+        if metrics["engine"]["model"] != record["model"] and not online(record, "/health"):
             return None
         hardware, live = metrics["hardware"], metrics["live"]
         recent = []
@@ -385,17 +387,25 @@ def prepare_vision_reader(root, mode, model, weights):
     projector = Path(model.get("projector") or "")
     if not projector.is_absolute() or not projector.is_file():
         raise ValueError("Attach an existing vision projector to this model before enabling image input.")
-    source = root / "source"
+    source = terminal_directory(root)
     sys.path.insert(0, str(source))
     import setup as strata
 
+    if source.name == "terminal":
+        from strata_control import engine_component
+
+        found = engine_component.resolve(full=False)
+        reader = found.root / ("strata-vision.exe" if os.name == "nt" else "strata-vision")
+        if reader.is_file():
+            return {"exe": str(reader), "mmproj": str(projector), "model": str(weights[0]),
+                    "gpu": mode == "gpu", "max_tokens": 1024 if mode == "gpu" else 300}
     directory = root / "vision-readers" / mode
     executable = directory / ("strata-vision.exe" if os.name == "nt" else "strata-vision")
     stamp = directory / "build.json"
     revision = (root / "prepared-commit").read_text(encoding="ascii").strip()
     if not executable.is_file() or read_json(stamp).get("revision") != revision:
         print(f"Preparing the Strata vision reader ({mode}).", flush=True)
-        llama = strata.get_llama_cpp()
+        llama = strata.get_llama_cpp() or root / "source" / "third_party" / "llama.cpp"
         definitions = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if mode == 'gpu' else 'OFF'}",
                        "-DSTRATA_PORTABLE=OFF", *strata.host_compiler_defs(mode == "gpu")]
         vcvars = strata.find_vcvars() if os.name == "nt" else None
@@ -405,7 +415,7 @@ def prepare_vision_reader(root, mode, model, weights):
             definitions.extend((f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
                                 *strata.toolkit_root_defs(nvcc)))
         build = source / f"build-plugin-vision-{mode}"
-        strata.cmake_build(source / "tools" / "vision", build, "strata-vision", definitions, vcvars,
+        strata.cmake_build(engine_sources(source) / "tools" / "vision", build, "strata-vision", definitions, vcvars,
                            f"build-plugin-vision-{mode}.bat" if os.name == "nt" else "")
         built = build / "bin" / executable.name
         if not built.is_file():
@@ -420,7 +430,7 @@ def prepare_vision_reader(root, mode, model, weights):
 
 
 def prepare_external_flash_next(root, profile, weights, model=None):
-    source = root / "source"
+    source = terminal_directory(root)
     tools = source / "tools"
     sys.path.insert(0, str(tools))
     from gguf_reader import GGUFFile
@@ -436,7 +446,12 @@ def prepare_external_flash_next(root, profile, weights, model=None):
         raise ValueError("For a custom Flash-Next pack, use Engine arguments and Server arguments in the profile.")
 
     binary = "strata.exe" if os.name == "nt" else "strata"
-    engine = next((source / name / binary for name in ("engine", "engine-cuda12")
+    component = None
+    if source.name == "terminal":
+        from strata_control import engine_component
+
+        component = engine_component.resolve(full=False)
+    engine = Path(component.exe) if component else next((source / name / binary for name in ("engine", "engine-cuda12")
                    if (source / name / binary).is_file()), None)
     if engine is None:
         raise ValueError("Set up the native Strata engine before preparing a custom Flash-Next pack.")
@@ -478,20 +493,60 @@ def prepare_external_flash_next(root, profile, weights, model=None):
             raise ValueError("Prepare the shared Flash-Next MTP draft layer before enabling it for this model.")
         args.extend(("--mtp", str(draft)))
     build = read_json(engine.parent / "BUILD.json")
-    config = {"exe": str(engine), "cwd": str(source), "tokenizer": str(tokenizer),
+    config = {"exe": "component:strata-engine" if component else str(engine), "cwd": str(source), "tokenizer": str(tokenizer),
               "log": str(pack / "engine.log"), "drafting": drafting, "args": args,
-              "lib_dirs": build.get("lib_dirs") or build.get("cuda_dirs") or []}
+              "lib_dirs": engine_component.package_lib_dirs(component.root) if component else build.get("lib_dirs") or build.get("cuda_dirs") or []}
     mode = profile.get("vision_mode", "off")
     if mode != "off":
         config["vision"] = prepare_vision_reader(root, mode, model or {}, weights)
     return config
 
 
+def prepare_inkling_config(root, profile, model, destination, strata):
+    if model.get("model") not in getattr(strata, "INKLING_FAMILIES", {}).get("inkling-2-mini", {}).get("models", {}):
+        raise ValueError("Update the Strata backend to v0.2.19 before preparing Inkling.")
+    from strata_control import inkling_family
+    import hashlib
+
+    folder = root / "models" / hashlib.sha256(model["id"].encode("utf-8")).hexdigest()[:20]
+    files = [(folder / name).resolve() for name in model["files"]]
+    if any(not path.is_relative_to(folder) or not path.is_file() for path in files):
+        raise ValueError("The Inkling model files are missing from their managed download.")
+    weight = next((path for path in files if path.name == inkling_family.build_file(model["model"])), None)
+    if weight is None:
+        raise ValueError("Download the selected Inkling .strata pack before loading it.")
+    controls = profile.get("controls") or {}
+    if any(value not in (None, "") for flag, value in controls.items() if flag != "--max-context"):
+        raise ValueError("Inkling uses native RAM/VRAM placement. Clear the Qwen resource controls for this profile.")
+    extra = [*profile.get("setup_args", []), *profile.get("launch_args", [])]
+    reject_routing_args(extra, {"--family", "--model", "--gguf-dir", "--data-dir", "--models-dir", "--feed",
+                                "--host", "--port", "--api-key", "--build", "--update"})
+    source = terminal_directory(root)
+    sys.argv = [str(source / "setup.py"), "--setup", "--yes", "--no-start", "--no-browser", "--host", "127.0.0.1",
+                "--family", "inkling-2-mini", "--model", model["model"], "--gguf-dir", str(weight.parent),
+                "--data-dir", str(root / "run-data"), "--vision", "none" if profile.get("vision_mode", "gpu") == "off" else "yes",
+                "--context", str(controls.get("--max-context") or inkling_family.DEFAULT_CONTEXT), *extra]
+    print(f"Preparing {model['title']} with its native Strata engine.", flush=True)
+    if strata.main():
+        raise ValueError("Strata could not prepare the Inkling profile.")
+    config = read_json(strata.home() / f"strata-{inkling_family.model_key(model['model'])}.json")
+    if not config.get("exe") or not config.get("args"):
+        raise ValueError("Inkling setup did not write a usable server config.")
+    from strata_control import shape_engine
+
+    found = shape_engine.find("inkling2", full=False)
+    write_json(root / "inkling-engine.json", {"exe": str(found.exe), "version": found.version})
+    write_json(destination, config)
+
+
 def prepare_config(root, profile, model, destination):
-    source = root / "source"
+    source = terminal_directory(root)
     sys.path.insert(0, str(source))
     import setup as strata
 
+    if model.get("family") == "inkling-2-mini":
+        prepare_inkling_config(root, profile, model, destination, strata)
+        return
     weights = catalog_shards(root, model)
     if model["source"] == "local":
         write_json(destination, prepare_external_flash_next(root, profile, weights, model))
@@ -542,7 +597,7 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
         if intent and previous.get("intent") == intent:
             return
         raise ValueError("This Strata profile is already running.")
-    source = root / "source"
+    source = terminal_directory(root)
     config_path = directory / "configs" / f"{key}.json"
     spec_path = directory / "configs" / f"{key}.prepare.json"
     write_json(spec_path, {"profile": profile, "model": model})

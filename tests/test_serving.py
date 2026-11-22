@@ -16,6 +16,18 @@ from dashboard import serving
 
 
 class ServingTests(unittest.TestCase):
+    def test_native_engine_model_info_does_not_hide_verified_alias_stats(self):
+        metrics = {"engine": {"model": "Inkling-2-Mini", "images": True},
+                   "hardware": {}, "live": {}, "requests": []}
+        record = {"port": 12345, "key": "test", "model": "saved-inkling-profile"}
+        with (
+            patch.object(serving, "urlopen", return_value=io.BytesIO(json.dumps(metrics).encode())),
+            patch.object(serving, "online", return_value=True) as health,
+        ):
+            result = serving.performance_stats(record)
+        self.assertTrue(result["images"])
+        health.assert_called_once_with(record, "/health")
+
     def test_newer_provider_revision_is_reused_by_a_compatible_caller(self):
         with TemporaryDirectory() as temp:
             root = Path(temp).resolve()

@@ -13,6 +13,7 @@ runtime_path = Path(__file__).resolve().with_name("runtime_api.py")
 load_lock = Lock()
 loaded_source = None
 loaded_runtime = None
+loaded_path = None
 runtime_state = {
     "update_lock": Lock(),
     "strata_jobs_lock": Lock(),
@@ -21,14 +22,17 @@ runtime_state = {
 
 
 def runtime():
-    global loaded_source, loaded_runtime
+    global loaded_source, loaded_runtime, loaded_path
     with load_lock:
         try:
-            source = runtime_path.read_bytes()
-            if source != loaded_source:
-                loaded_runtime = runpy.run_path(str(runtime_path), init_globals=runtime_state)
+            access = runpy.run_path(str(runtime_path.with_name("profile_access.py")))
+            path = access["runtime_api_path"](runtime_path)
+            source = path.read_bytes()
+            if source != loaded_source or path != loaded_path:
+                loaded_runtime = runpy.run_path(str(path), init_globals=runtime_state)
                 loaded_source = source
-        except (OSError, ImportError, SyntaxError) as exc:
+                loaded_path = path
+        except (OSError, ImportError, SyntaxError, ValueError) as exc:
             raise HTTPException(503, "The Strata backend is being updated or could not load.") from exc
         return loaded_runtime
 

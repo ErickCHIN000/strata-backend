@@ -13,9 +13,11 @@ In Hermes Desktop, open **Capabilities → Plugins**, rescan, and enable the Des
 
 ## Set up Strata
 
-Open **Strata Backend** in the sidebar and choose **Download and set up**. The plugin tracks [`Niko1221/Strata` on `main`](https://github.com/Niko1221/Strata/tree/main), builds the checked-out engine source, and installs the Python dependencies in a private `.venv`. Model selection is separate. Engine setup needs the toolchain for the selected GPU. The page shows the setup log while it runs.
+Open **Strata Backend** in the sidebar and choose **Download and set up**. The plugin installs the supported [`Niko1221/Strata v0.2.19`](https://github.com/Niko1221/Strata/releases/tag/v0.2.19) release, verifies its signed native engine package, and installs the Python dependencies in a private `.venv`. Model selection is separate. The page shows the setup log while it runs.
 
-Use **Update Strata** to fast-forward the managed checkout and run setup again. **Fresh wipe** removes only the managed Strata directory in this Hermes profile, including its venv, downloaded models, build products, and setup files.
+Use **Update Strata** to fast-forward the managed checkout to the supported **v0.2.19** release and prepare its signed native engine package. The Python runtime stays in the plugin’s venv. **Fresh wipe** removes the managed Strata directory in this Hermes profile, including its venv, downloaded models, build products, and setup files.
+
+**Inkling 2 Mini** uses its own signed `strata-inkling` engine. Choose **Inkling-2-Mini → SQ-20** in the Strata catalog to download the lossless native `Inkling-2-Mini-SQ-20.strata`, its vision pack, and tokenizer files. Save a profile linked to that download and enable **Image input → On (native vision)**. The default context is 32,768 tokens, with DSpark drafting. Context is adjustable up to the engine’s supported limit. Inkling uses native RAM/VRAM placement; additional tuning is available through its Engine arguments and the Inkling engine option reference.
 
 Once the engine is ready, **Suggested models** shows Strata's hardware-based recommendation and its catalog. Choose **Download** on a specific entry to fetch its weights. **Open models folder** opens the local profile's managed downloads in the file manager, including when the folder is empty. The page lists download size separately from the memory estimate. Downloads do not start a model or change the Hermes provider.
 
@@ -44,6 +46,8 @@ Use **Delete model** under **Models** to remove a managed download. Locally adde
 ## Share Strata with other bots
 
 Open **Profile access** in the Strata tab of the profile that owns the installation. Check each local Hermes bot/profile that should use it. Hermes enables a small connector in that profile and registers the same Strata provider and saved model presets. The common installation supplies the Python environment, model files, native packs, and model profiles. New and edited presets refresh the enabled profiles’ provider lists.
+
+Linked profiles run the owner’s backend handlers, so owner plugin updates also supply their model preparation and serving behavior.
 
 Other bots can select a Strata preset in their model pickers and send messages to load it. Shared bot requests run in order on the same engine, including when another bot is focused. The model stays loaded between replies. Explicit Stop, switching models, and closing the last Desktop window still release the selected model. The lightweight shared provider remains available to enabled bots. Remove a bot’s access with its checkbox after choosing a different default model for that bot.
 

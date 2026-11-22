@@ -5,6 +5,7 @@ import json
 import ntpath
 import os
 import re
+import runpy
 import shutil
 import sys
 from pathlib import Path, PureWindowsPath
@@ -19,6 +20,7 @@ SHA = re.compile(r"[0-9a-f]{40}")
 SHARD = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf", re.IGNORECASE)
 CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 CHUNK = 1024 * 1024
+terminal_directory = runpy.run_path(str(Path(__file__).with_name("runtime_paths.py")))["terminal_directory"]
 
 
 class DownloadPaused(Exception):
@@ -159,7 +161,7 @@ def inspect_local_model(root, payload):
         raise ValueError("Scan the folder and choose a complete GGUF file or shard set.")
     directory = Path(catalog["path"])
     files = [directory / file["name"] for file in group["files"]]
-    sys.path.insert(0, str(root / "source" / "tools"))
+    sys.path.insert(0, str(terminal_directory(root) / "tools"))
     from gguf_reader import GGUFFile
 
     headers = [GGUFFile(file) for file in files]
@@ -238,6 +240,17 @@ def hub_file(url, pin=None):
 
 
 def catalog_files(strata, family, model):
+    if family in getattr(strata, "INKLING_FAMILIES", {}):
+        from strata_control import inkling_family
+
+        if model not in strata.INKLING_FAMILIES[family]["models"]:
+            raise ValueError("Choose an Inkling model build from Strata's catalog.")
+        repo = "strata-engine/Inkling-2-Mini-Strata"
+        info = hub_info(repo)
+        names = [*inkling_family.files_of(model, True), *inkling_family.TOKENIZER_FILES]
+        files = [{"repo": repo, "revision": info.sha, "name": name,
+                  "bytes": inkling_family.size_of(name), "sha256": inkling_family.sha256_of(name)} for name in names]
+        return f"{inkling_family.TITLE} {model} + vision", files
     if family in strata.MULTI_FILE_FAMILIES:
         fam = strata.MULTI_FILE_FAMILIES[family]
         spec = fam["models"].get(model)
@@ -383,7 +396,7 @@ def download_model(root, selection):
     identity = model_id(selection)
     folder = managed_dir(root, identity)
     if selection["source"] == "catalog":
-        sys.path.insert(0, str(root / "source"))
+        sys.path.insert(0, str(terminal_directory(root)))
         import setup as strata
 
         if hasattr(strata, "feed_models_setup"):
@@ -435,6 +448,9 @@ def download_model(root, selection):
               "bytes": sum((folder / path).stat().st_size for path in paths),
               "artifacts": [{"path": path, "repo": file["repo"], "revision": file["revision"], "sha256": file["sha256"]}
                             for path, file in zip(paths, files, strict=True)]}
+    if selection.get("family") == "inkling-2-mini":
+        record.update(format="strata", architecture="inkling2_loop",
+                      projector=str(folder / "strata-engine--Inkling-2-Mini-Strata" / "Inkling-2-Mini-Vision.strata"))
     marker = folder / "model.json.tmp"
     marker.write_text(json.dumps(record, indent=2), encoding="utf-8")
     os.replace(marker, folder / "model.json")

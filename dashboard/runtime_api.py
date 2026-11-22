@@ -24,9 +24,11 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 MODEL_HELPER = Path(__file__).with_name("model_download.py")
 SERVING_HELPER = Path(__file__).with_name("serving.py")
 ACCESS_HELPER = Path(__file__).with_name("profile_access.py")
+terminal_directory = runpy.run_path(str(Path(__file__).with_name("runtime_paths.py")))["terminal_directory"]
 STRATA_REPO = "Niko1221/Strata"
 STRATA_ORIGIN = f"https://github.com/{STRATA_REPO}.git"
-STRATA_BRANCH = "main"
+STRATA_RELEASE = "v0.2.19"
+STRATA_FEED = f"https://github.com/{STRATA_REPO}/releases/download/{STRATA_RELEASE}/strata-feed.json"
 STRATA_CATALOG_READER = """
 import json
 from pathlib import Path
@@ -53,6 +55,8 @@ STRATA_SETUP_RUNNER = r"""
 import os
 import re
 import sys
+
+from pathlib import Path
 
 def require_existing_toolchain(event, args):
     if event != "subprocess.Popen":
@@ -82,6 +86,20 @@ if hip_cards and os.name == "nt":
 
 print("Installing Strata's Python runtime packages.", flush=True)
 strata.pip_install(strata.runtime_packages(), "Strata Python runtime packages")
+if Path.cwd().name == "terminal":
+    from strata_control import engine_component, signing, updater
+    components = engine_component.components_dir()
+    ctx = updater.Context(components=components, source=os.environ["STRATA_UPDATE_FEED"],
+                          trusted=signing.load_trusted_keys(), hardware=updater.detect_hardware(),
+                          emit=lambda event: print(event.get("message", ""), flush=True) if event.get("message") else None)
+    result = updater.run_update(ctx, engine=True, control=False, app=False)
+    if result["exit_code"]:
+        sys.exit("The signed Strata engine update failed. Check the setup log.")
+    found = engine_component.resolve(full=False)
+    print(f"Engine ready: {found.version} at {found.exe}", flush=True)
+    Path(os.environ["STRATA_RUNTIME_ROOT"], "engine-info.json").write_text(
+        __import__("json").dumps({"version": found.version, "exe": str(found.exe)}), encoding="utf-8")
+    sys.exit(0)
 llama = strata.get_llama_cpp()
 if cuda_cards:
     gpu = cuda_cards[0]
@@ -301,6 +319,8 @@ def strata_status():
             "download": transfer,
             "error": error.read_text(encoding="utf-8") if error.is_file() else None,
             "log": output,
+            "release": STRATA_RELEASE,
+            "engine_version": serving_tools()["read_json"](root / "engine-info.json").get("version"),
         }
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         return {"has_data": True, "error": str(exc) if isinstance(exc, ValueError) else "Could not read Strata setup status."}
@@ -311,7 +331,7 @@ def strata_latest():
         revision = strata_head(strata_directory())
     except (ValueError, OSError, subprocess.SubprocessError):
         return {"latest": None, "update_available": False}
-    latest, update_available = github_revision(STRATA_REPO, STRATA_BRANCH, revision)
+    latest, update_available = github_revision(STRATA_REPO, STRATA_RELEASE, revision)
     return {"latest": latest, "update_available": update_available}
 
 
@@ -331,6 +351,8 @@ def managed_environment(root: Path) -> dict[str, str]:
         HF_HOME=str(root / "hf-cache"),
         STRATA_SETTINGS_FILE=str(root / "settings.json"),
         STRATA_COMPONENTS_DIR=str(root / "components"),
+        STRATA_UPDATE_FEED=STRATA_FEED,
+        STRATA_RUNTIME_ROOT=str(root),
     )
     return env
 
@@ -344,7 +366,7 @@ def strata_models():
         env["STRATA_NO_ACQUIRE"] = "1"
         result = subprocess.run(
             [str(strata_python(root)), "-B", "-c", STRATA_CATALOG_READER],
-            cwd=root / "source", env=env, stdin=subprocess.DEVNULL, capture_output=True,
+            cwd=terminal_directory(root), env=env, stdin=subprocess.DEVNULL, capture_output=True,
             encoding="utf-8", timeout=45, check=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -461,7 +483,7 @@ def add_local_model(payload):
 
     try:
         root = strata_directory()
-        if not strata_python(root).is_file() or not (root / "source" / "tools" / "gguf_reader.py").is_file():
+        if not strata_python(root).is_file() or not (terminal_directory(root) / "tools" / "gguf_reader.py").is_file():
             raise ValueError("Set up Strata before adding a local model.")
         with plugin_update_lock(root):
             result = subprocess.run(
@@ -878,15 +900,21 @@ def save_model_profile(payload):
 def model_option_reference():
     try:
         root = strata_directory()
-        source = root / "source"
+        source = terminal_directory(root)
         python = str(strata_python(root))
         engine = next((source / name / ("strata.exe" if os.name == "nt" else "strata")
                        for name in ("engine", "engine-cuda12")
                        if (source / name / ("strata.exe" if os.name == "nt" else "strata")).is_file()), None)
+        info = serving_tools()["read_json"](root / "engine-info.json")
+        if info.get("exe") and Path(info["exe"]).is_file():
+            engine = Path(info["exe"])
         commands = {"Engine": [str(engine), "--help"] if engine else None,
                     "Setup": [python, "-B", "setup.py", "--help"],
                     "Launch": [python, "-B", "strata.py", "launch", "--help"],
                     "Server": [python, "-B", "-m", "serve.server", "--help"]}
+        inkling = serving_tools()["read_json"](root / "inkling-engine.json")
+        if inkling.get("exe") and Path(inkling["exe"]).is_file():
+            commands["Inkling engine"] = [inkling["exe"], "--help"]
         reference = {}
         for title, command in commands.items():
             if command:
@@ -907,21 +935,28 @@ def model_option_reference():
 
 
 def prepare_strata(root: Path, operation: str, log) -> None:
+    from time import time
+
+    tools = serving_tools()
+    active = tools["read_json"](tools["service_root"](root) / "active-request.json")
+    if active.get("seen", 0) >= time() - tools["DESKTOP_LEASE_SECONDS"]:
+        raise ValueError("Wait for the current Strata reply to finish before updating the backend.")
+    for row in tools["instance_rows"](root):
+        if row["managed"] and not row.get("provider") and row["state"] != "exited":
+            tools["stop_instance"](root, row)
     revision = strata_head(root)
     source = root / "source"
     if not revision:
         with TemporaryDirectory(prefix=".clone-", dir=root) as staging:
             candidate = Path(staging) / "source"
-            git_at(root, "clone", "--filter=blob:none", "--single-branch", "--branch", STRATA_BRANCH,
+            git_at(root, "clone", "--filter=blob:none", "--single-branch", "--branch", STRATA_RELEASE,
                    STRATA_ORIGIN, str(candidate), timeout=900)
             candidate.rename(source)
     else:
         if git_at(source, "status", "--porcelain", "--untracked-files=no"):
             raise ValueError("Save or stash tracked Strata changes before setup or update.")
         if operation == "update":
-            if git_at(source, "symbolic-ref", "--short", "HEAD") != STRATA_BRANCH:
-                raise ValueError("The managed Strata checkout must be on main before updating.")
-            git_at(source, "fetch", STRATA_ORIGIN, f"refs/heads/{STRATA_BRANCH}", timeout=900)
+            git_at(source, "fetch", STRATA_ORIGIN, f"refs/tags/{STRATA_RELEASE}", timeout=900)
             git_at(source, "merge", "--ff-only", "FETCH_HEAD", timeout=900)
 
     # Clear readiness before touching setup so a retry can resume an incomplete install.
@@ -930,7 +965,7 @@ def prepare_strata(root: Path, operation: str, log) -> None:
     python = strata_python(root)
     env = managed_environment(root)
     options = {
-        "cwd": source, "env": env, "stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT,
+        "cwd": terminal_directory(root), "env": env, "stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT,
         "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0), "check": True,
     }
     if not python.is_file():

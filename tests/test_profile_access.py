@@ -22,6 +22,10 @@ class ProfileAccessTests(unittest.TestCase):
         token = set_hermes_home_override(self.home)
         self.addCleanup(reset_hermes_home_override, token)
         (self.home / "config.yaml").write_text("model:\n  default: cloud-model\nagent:\n  max_turns: 17\n", encoding="utf-8")
+        owner_api = self.home / "plugins/strata-backend/dashboard/runtime_api.py"
+        owner_api.parent.mkdir(parents=True)
+        source = str(Path("dashboard/runtime_api.py").resolve())
+        owner_api.write_text(f"import runpy\nglobals().update(runpy.run_path({source!r}, init_globals=globals()))\n", encoding="utf-8")
         self.bot = self.home / "profiles" / "test-bot"
         self.bot.mkdir(parents=True)
         (self.bot / "config.yaml").write_text("model:\n  default: cloud-model\nagent:\n  max_turns: 23\n", encoding="utf-8")

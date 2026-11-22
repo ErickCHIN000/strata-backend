@@ -53,6 +53,17 @@ def runtime_directory(local_data):
     return data / "strata-runtime"
 
 
+def runtime_api_path(local_path):
+    data = data_directory(get_hermes_home())
+    if not read_state(data / "shared-runtime.json"):
+        return local_path
+    root = runtime_directory(data)
+    source = owner_home(root) / "plugins" / "strata-backend" / "dashboard" / "runtime_api.py"
+    if not source.is_file():
+        raise ValueError("The shared Strata owner plugin is unavailable.")
+    return source
+
+
 def provider_profiles(root):
     owner = owner_home(root)
     targets = read_state(root.parent / "profile-access.json").get("profiles", [])
