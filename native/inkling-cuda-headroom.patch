@@ -1,0 +1,390 @@
+--- a/engine/src/inkling2/ink_backend.h
++++ b/engine/src/inkling2/ink_backend.h
+@@ -131,10 +131,9 @@
+ inline std::unique_ptr<InkBackend> make_default_backend(bool force_cpu = false, const BackendOpts* opts = nullptr) {
+     if (!force_cpu) {
+ #ifdef INKLING_ENABLE_EP_CUDA
+-        // Prefer modular Dual-GPU EP / Graph-Doorbell Hybrid CUDA backend when --gpus >= 2, --cpu-threads > 0,
+-        // --vram-reserve-mib >= 0, or when K8V8/K8V4 KV is selected (or when primary CUDA backend isn't built).
++        // Dual-GPU and integer KV use EP; single-GPU FP16/FP8 retain the optimized CUDA hybrid path.
+         const bool need_ep_or_hybrid = opts && (
+-            opts->gpus >= 2 || opts->cpu_threads > 0 || opts->vram_reserve_mib >= 0 ||
++            opts->gpus >= 2 ||
+             opts->kv_dtype == KvDtype::K8V8 || opts->kv_dtype == KvDtype::K8V4);
+         if (need_ep_or_hybrid) return make_ep_cuda_backend();
+ #endif
+--- a/engine/src/inkling2/ink_main.cpp
++++ b/engine/src/inkling2/ink_main.cpp
+@@ -21,7 +21,7 @@
+ using namespace ink2;
+ 
+ #ifndef INKLING_VERSION
+-#define INKLING_VERSION "0.1.65"
++#define INKLING_VERSION "0.1.65-hermes-cuda4"
+ #endif
+ 
+ static int cmd_export_tokenizer(const std::string& file, const std::string& dir) {
+--- a/engine/src/inkling2/cuda/ink_cuda_backend.cu
++++ b/engine/src/inkling2/cuda/ink_cuda_backend.cu
+@@ -97,6 +97,8 @@
+     bool init(const InkModelFile& mf, const BackendOpts& opts, std::string& err) override {
+         cleanup();
+         gpu_id_ = opts.gpu_index;
++        const char* floor = std::getenv("HERMES_INKLING_VRAM_FLOOR_MIB");
++        model_.vram_floor_bytes = floor ? (size_t)std::strtoull(floor, nullptr, 10) << 20 : 0;
+         cudaError_t ce = cudaSetDevice(gpu_id_);
+         if (ce != cudaSuccess) {
+             err = std::string("cudaSetDevice failed: ") + cudaGetErrorString(ce);
+@@ -128,16 +130,19 @@
+         const size_t sc_per_pos = (kv_dtype_ == KvDtype::FP8_E4M3) ? (size_t)(2 * strata::ink::kInkKVHeads * 4) : 0ull;
+         const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos)
+                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
+-                                  + (size_t)8 * max_slots_ * 256 * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
++                                  + (size_t)8 * max_slots_ * std::max(256, opts.max_ctx) * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
+         const size_t ws_pad = (max_slots_ >= 8) ? (1536ull << 20)
+                             : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
+                              : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
+                                                                       : (320ull << 20));
+-        const size_t min_reserve_bytes = min_kv_bytes + ws_pad;
++        const size_t draft_bytes = opts.enable_dspark && mf.m.dspark.present
++            ? (size_t)std::max(256, opts.max_ctx) * (6 * strata::ink::kInkKVDim * sizeof(__half) + strata::ink::kInkHidden * sizeof(float)) : 0;
++        const size_t requested_free = (size_t)std::max(0, opts.vram_reserve_mib) << 20;
++        const size_t min_reserve_bytes = min_kv_bytes + ws_pad + draft_bytes + requested_free;
+ 
+         // Load .strata v1.1 trunk + experts (100% VRAM or 3x loop-weighted vram_load_order!)
+         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
+-        if (!model_.load(mf.path, gpu_id_, build_screen, err, min_reserve_bytes)) return false;
++        if (!model_.load(mf.path, gpu_id_, build_screen, err, min_reserve_bytes, opts.vram_experts_gb, opts.cpu_threads)) return false;
+ 
+         auto cuda_kvd = (kv_dtype_ == KvDtype::FP8_E4M3) ? strata::ink::InkKvDtype::FP8
+                                                           : strata::ink::InkKvDtype::FP16;
+@@ -146,6 +151,10 @@
+         runner_->use_cuda_graph = true;
+         runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd);
+         eff_max_ctx_ = runner_->max_ctx;
++        if (eff_max_ctx_ != std::max(256, opts.max_ctx)) {
++            err = "The requested Inkling context and free VRAM do not fit. Reduce context, disable DSpark, or lower the GPU expert cap.";
++            return false;
++        }
+ 
+         if (opts.enable_dspark && model_.man.has_dspark) {
+             dspark_ = std::make_unique<strata::ink::InkDSpark>(*runner_);
+--- a/engine/src/inkling2/cuda/ink_runner.cuh
++++ b/engine/src/inkling2/cuda/ink_runner.cuh
+@@ -21,6 +21,9 @@
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
++#if defined(_WIN32)
++#include <windows.h>
++#endif
+ 
+ namespace strata::ink {
+ 
+@@ -61,6 +64,43 @@
+ // ============================================================================
+ // InkCudaModel: GPU-resident .strata v1.1 Trunk + Experts + Pre-processed Tensors
+ // ============================================================================
++#if defined(_WIN32)
++// WDDM's CUDA budget omits graphics allocations; NVML supplies whole-device availability.
++class NvmlMemoryView final {
++    struct Memory { unsigned long long total = 0, free = 0, used = 0; };
++    using Init = int (*)();
++    using ByPci = int (*)(const char*, void**);
++    using Read = int (*)(void*, Memory*);
++    HMODULE module_ = nullptr;
++    Init shutdown_ = nullptr;
++    ByPci by_pci_ = nullptr;
++    Read read_ = nullptr;
++    bool ready_ = false;
++public:
++    NvmlMemoryView() {
++        module_ = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++        if (!module_) return;
++        Init initialize = reinterpret_cast<Init>(GetProcAddress(module_, "nvmlInit_v2"));
++        shutdown_ = reinterpret_cast<Init>(GetProcAddress(module_, "nvmlShutdown"));
++        by_pci_ = reinterpret_cast<ByPci>(GetProcAddress(module_, "nvmlDeviceGetHandleByPciBusId_v2"));
++        read_ = reinterpret_cast<Read>(GetProcAddress(module_, "nvmlDeviceGetMemoryInfo"));
++        ready_ = initialize && shutdown_ && by_pci_ && read_ && initialize() == 0;
++    }
++    ~NvmlMemoryView() {
++        if (ready_) shutdown_();
++        if (module_) FreeLibrary(module_);
++    }
++    size_t FreeBytes(int gpu, size_t fallback) const {
++        if (!ready_) return fallback;
++        char pci[32] = {};
++        void* device = nullptr;
++        Memory memory;
++        if (cudaDeviceGetPCIBusId(pci, sizeof(pci), gpu) != cudaSuccess || by_pci_(pci, &device) != 0 || read_(device, &memory) != 0) return fallback;
++        return std::min(fallback, static_cast<size_t>(memory.free));
++    }
++};
++#endif
++
+ struct InkCudaModel {
+     InkManifest man;
+     strata::artifact::StrataFileReader rd;
+@@ -74,6 +114,15 @@
+     uint8_t* h_sec4_pinned = nullptr;  // optional pinned overflow for 8/12/16 GB GPUs
+     size_t trunk_bytes = 0, sec4_bytes = 0;
+     size_t n_vram_experts = 0, n_host_experts = 0;
++    size_t vram_floor_bytes = 0;
++    size_t GloballyFreeVram(size_t local_free) const {
++#if defined(_WIN32)
++        static NvmlMemoryView memory;
++        return memory.FreeBytes(primary_gpu, local_free);
++#else
++        return local_free;
++#endif
++    }
+ 
+     // Preprocessed per-layer F32 buffers (tiny: < 40 MB total)
+     float* d_msg_queries[12] = {};      // [4, 2304] F32 for physical layers 6..17
+@@ -98,7 +147,7 @@
+         return man.get(name);
+     }
+ 
+-    bool load(const std::string& strata_path, int gpu_id, bool build_screen, std::string& err, size_t extra_reserve_bytes = 0) {
++    bool load(const std::string& strata_path, int gpu_id, bool build_screen, std::string& err, size_t extra_reserve_bytes = 0, double expert_cap_gib = -1.0, int cpu_threads = 0) {
+         path = strata_path;
+         primary_gpu = gpu_id;
+         INK_CK(cudaSetDevice(primary_gpu));
+@@ -178,8 +227,13 @@
+                                   : (vtot <= (13ull << 30)) ? (780ull << 20)
+                                                             : (1280ull << 20);
+         const size_t reserve = std::max(base_reserve, extra_reserve_bytes);
++        if (vfree <= reserve + (256ull << 20)) {
++            err = "Inkling context, drafting buffers and the requested free VRAM exceed the GPU budget. Disable DSpark or reduce context.";
++            return false;
++        }
++        const size_t expert_cap = expert_cap_gib < 0.0 ? sec4_bytes : (size_t)(expert_cap_gib * 1073741824.0);
+         for (int il = 0; il < 24; ++il) layer_has_host[il] = false;
+-        if (vfree > sec4_bytes + reserve) {
++        if (vfree > sec4_bytes + reserve && sec4_bytes <= expert_cap) {
+             // 100% VRAM resident! Single sequential streaming DMA!
+             INK_CK(cudaMalloc(&d_sec4, sec4_bytes));
+             const size_t CH = 64ull << 20;
+@@ -210,7 +264,7 @@
+             // Reserve full headroom (1.66 GiB for runner+DSpark+cuBLAS+Graph + 256 MiB for ping-pong DMA + promo ring)!
+             const size_t hyb_post_res = std::max(reserve, (size_t)(1664ull << 20));
+             const size_t hyb_reserve = hyb_post_res + (256ull << 20);
+-            const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
++            const size_t vram_budget = std::min(expert_cap, (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0);
+             size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
+             std::vector<uint8_t> in_vram(n_total, 0);
+             for (uint16_t di : order) {
+@@ -263,7 +317,7 @@
+                 }
+             }
+             if (n_host_experts > 0) {
+-                hybrid.start_workers();
++                hybrid.start_workers(cpu_threads);
+                 size_t vf_now = 0, vt_now = 0;
+                 INK_CK(ink_cuda_mem_info(&vf_now, &vt_now));
+                 const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
+@@ -1028,9 +1082,22 @@
+         }
+     }
+ 
+-    void ensure_pf_attn(int K_len) {
+-        constexpr int Q_CH = 512;
+-        if (K_len <= pf_kv_cap && d_pf_q) return;
++    bool ensure_pf_attn(int K_len) {
++        constexpr int Q_CH = 256;
++        if (K_len <= pf_kv_cap && d_pf_q) return true;
++        const int capacity = std::max(K_len, 2048);
++        auto bytes = [&](int cap) {
++            return (size_t)kInkHeads * (max_batch * kInkHeadDim * sizeof(__nv_bfloat16)
++                + (size_t)cap * (2 * kInkHeadDim * sizeof(__nv_bfloat16) + Q_CH * (sizeof(float) + sizeof(__nv_bfloat16)))
++                + Q_CH * kInkHeadDim * sizeof(float));
++        };
++        size_t available = 0, total = 0;
++        INK_CK(cudaMemGetInfo(&available, &total));
++        available = m.GloballyFreeVram(available);
++        const size_t old_bytes = d_pf_q ? bytes(pf_kv_cap) : 0;
++        if (m.vram_floor_bytes && available + old_bytes < bytes(capacity) + m.vram_floor_bytes + (256ull << 20)) {
++            return false; // Keep attention on the GPU without allocating a larger score matrix.
++        }
+         INK_CK(cudaStreamSynchronize(st));
+         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
+         fr(d_pf_q); fr(d_pf_k); fr(d_pf_v); fr(d_pf_p); fr(d_pf_s); fr(d_pf_o);
+@@ -1041,6 +1108,7 @@
+         d_pf_s = dalloc<float>((size_t)kInkHeads * Q_CH * pf_kv_cap);
+         d_pf_p = dalloc<__nv_bfloat16>((size_t)kInkHeads * Q_CH * pf_kv_cap);
+         d_pf_o = dalloc<float>((size_t)kInkHeads * Q_CH * kInkHeadDim);
++        return true;
+     }
+ 
+     // ---- Execute 1 virtual visit (visit in 0..47, phys layer ip in 0..23) ----
+@@ -1223,14 +1291,14 @@
+                     (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
+                     p0_val, d_attn_pm, d_attn_pl, d_attn_po, M);
+                 k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M);
+-            } else if (mode == 0 && M >= 128 && (m.sm_cc >= 70 || m.sm_cc == 60) && (d_pf_q != nullptr || [&](){ size_t vf=0,vt=0; cudaMemGetInfo(&vf,&vt); return vf > (480ull<<20); }())) {
++            } else if (mode == 0 && M >= 128 && (m.sm_cc >= 70 || m.sm_cc == 60)
++                       && ensure_pf_attn(is_swa ? std::min(p0_val + M, kInkSwaWin - 1 + M) : p0_val + M)) {
+                 // High-speed Causal/SWA-Sliced Tensor Core Prefill Attention (BF16 on sm_80+, FP16 on sm_60..75!)
+                 const bool use_fp16_pf = (m.sm_cc < 80);
+                 const cudaDataType_t pf_dt = use_fp16_pf ? CUDA_R_16F : CUDA_R_16BF;
+                 const cublasGemmAlgo_t pf_algo = (m.sm_cc >= 70) ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
+                 const int k_start = is_swa ? std::max(0, p0_val - kInkSwaWin + 1) : 0;
+                 const int K_len = (p0_val + M) - k_start;
+-                ensure_pf_attn(K_len);
+                 if (use_fp16_pf) {
+                     k_ink_pf_pack_q<true><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
+                     k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v);
+--- a/engine/src/inkling2/ink_serve.h
++++ b/engine/src/inkling2/ink_serve.h
+@@ -381,6 +381,8 @@
+           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
+           P, cfg.bopts.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16",
+           use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
++    const auto placement = backend.stats();
++    proto("INFO vram_experts=%zu ram_experts=%zu", placement.vram_experts_loaded, placement.ram_experts_loaded);
+     proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
+ 
+     std::vector<ActiveReq> reqs(P);
+--- a/engine/src/inkling2/cuda/ink_hybrid.cuh
++++ b/engine/src/inkling2/cuda/ink_hybrid.cuh
+@@ -453,7 +453,7 @@
+     return 0.0f;
+ }
+ 
+-inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float* y_out) noexcept {
++inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float* y_out, float* shared_act = nullptr, int phase = -1, int worker = 0, int workers = 1) noexcept {
+     constexpr int D = kInkHidden;
+     constexpr int I = kInkInter;
+     const uint8_t* body = em.body;
+@@ -461,7 +461,9 @@
+         std::memset(y_out, 0, (size_t)D * sizeof(float));
+         return;
+     }
+-    float act[I];
++    float local_act[I];
++    float* act = shared_act ? shared_act : local_act;
++    if (phase != 1) {
+ 
+     // 1. Gate + Up + SITU(4.0, 25.0)
+     if (em.gu_code == FMT_SF4) {
+@@ -470,7 +472,7 @@
+         const float w_outer = hdr[0] / hdr[1];
+         const uint8_t* bp = body + 16;
+         const uint8_t* bs = bp + (size_t)(2 * I) * (D / 2);
+-        for (int j = 0; j < I; ++j) {
++        for (int j = worker * I / workers; j < (worker + 1) * I / workers; ++j) {
+             const float g = dot_sf4_row_h(bp + (size_t)(2 * j) * (D / 2), bs + (size_t)(2 * j) * (D / 16), w_outer, x, D);
+             const float u = dot_sf4_row_h(bp + (size_t)(2 * j + 1) * (D / 2), bs + (size_t)(2 * j + 1) * (D / 16), w_outer, x, D);
+             const float sig = 1.0f / (1.0f + std::exp(-g));
+@@ -479,7 +481,7 @@
+     } else if (em.gu_code == FMT_MX8) {
+         const uint8_t* bp = body;
+         const uint8_t* bs = bp + (size_t)(2 * I) * D;
+-        for (int j = 0; j < I; ++j) {
++        for (int j = worker * I / workers; j < (worker + 1) * I / workers; ++j) {
+             const float g = dot_mx8_row_h(bp + (size_t)(2 * j) * D, bs + (size_t)(2 * j) * (D / 32), x, D);
+             const float u = dot_mx8_row_h(bp + (size_t)(2 * j + 1) * D, bs + (size_t)(2 * j + 1) * (D / 32), x, D);
+             const float sig = 1.0f / (1.0f + std::exp(-g));
+@@ -491,7 +493,7 @@
+         const int sb = ink_sb_bytes(em.gu_code);
+         const size_t row_b = 9ull * sb;
+         const uint8_t* gu_base = body + I * 2;
+-        for (int j = 0; j < I; ++j) {
++        for (int j = worker * I / workers; j < (worker + 1) * I / workers; ++j) {
+             const uint8_t* gr = gu_base + (size_t)(2 * j) * row_b;
+             const uint8_t* ur = gr + row_b;
+             float g = 0.0f, u = 0.0f;
+@@ -514,6 +516,9 @@
+         }
+     }
+ 
++    }
++    if (phase == 0) return;
++
+     // 2. Down projection [D, I]
+     if (em.dn_code == FMT_SF4) {
+         float hdr[4];
+@@ -521,13 +526,13 @@
+         const float w_outer = hdr[2] / hdr[3];
+         const uint8_t* bp = body + em.dn_off;
+         const uint8_t* bs = bp + (size_t)D * (I / 2);
+-        for (int r = 0; r < D; ++r) {
++        for (int r = worker * D / workers; r < (worker + 1) * D / workers; ++r) {
+             y_out[r] = dot_sf4_row_h(bp + (size_t)r * (I / 2), bs + (size_t)r * (I / 16), w_outer, act, I);
+         }
+     } else if (em.dn_code == FMT_MX8) {
+         const uint8_t* bp = body + em.dn_off;
+         const uint8_t* bs = bp + (size_t)D * I;
+-        for (int r = 0; r < D; ++r) {
++        for (int r = worker * D / workers; r < (worker + 1) * D / workers; ++r) {
+             y_out[r] = dot_mx8_row_h(bp + (size_t)r * I, bs + (size_t)r * (I / 32), act, I);
+         }
+     } else {
+@@ -536,7 +541,7 @@
+         const int sb = ink_sb_bytes(em.dn_code);
+         const size_t pair_b = 9ull * sb;
+         const uint8_t* dn_base = body + em.dn_off;
+-        for (int pr = 0; pr < D / 2; ++pr) {
++        for (int pr = worker * (D / 2) / workers; pr < (worker + 1) * (D / 2) / workers; ++pr) {
+             const uint8_t* blk0 = dn_base + (size_t)pr * pair_b;
+             float y0 = 0.0f, y1 = 0.0f;
+             for (int s = 0; s < 9; ++s) {
+@@ -710,12 +715,16 @@
+     int cur_layer = 0, cur_nj = 0;
+     int cur_slot_k[kInkTopK] = {}, cur_eid[kInkTopK] = {};
+     float cur_x[kInkHidden] = {};
++    float cur_act[kInkTopK][kInkInter] = {};
++    int cur_phase = 0;
+     std::vector<std::thread> workers;
+     std::thread master_thr;
+     int n_threads = 0;
+ 
+     void start_workers(int num_threads = 0) {
+         if (active) return;
++        (void)host_eval::e4m3_lut_h();
++        (void)host_eval::ue8m0_lut_h();
+         const int hw = std::max(1, (int)std::thread::hardware_concurrency());
+         n_threads = (num_threads > 0) ? num_threads : std::min(16, std::max(2, hw / 2));
+         INK_CK(cudaHostAlloc(&h_bell, sizeof(InkMappedDoorbell), cudaHostAllocMapped));
+@@ -755,9 +764,10 @@
+                         continue;
+                     }
+                     seen = g;
+-                    for (int j = t; j < cur_nj; j += n_threads) {
++                    for (int j = 0; j < cur_nj; ++j) {
+                         const int key = cur_layer * n_experts + cur_eid[j];
+-                        host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]));
++                        host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]),
++                                                    cur_act[j], cur_phase, t, n_threads);
+                     }
+                     work_done.fetch_add(1, std::memory_order_release);
+                     last_t = std::chrono::steady_clock::now();
+@@ -784,16 +794,18 @@
+                     cur_eid[j]    = h_bell->expert_id[j];
+                 }
+                 std::memcpy(cur_x, const_cast<const float*>(h_bell->x), kInkHidden * sizeof(float));
+-                work_done.store(0, std::memory_order_relaxed);
+-                if (n_threads > 1 && cur_nj > 1) {
+-                    work_gen.fetch_add(1, std::memory_order_release);
+-                }
+-                for (int j = 0; j < cur_nj; j += (cur_nj > 1 ? n_threads : 1)) {
+-                    const int key = cur_layer * n_experts + cur_eid[j];
+-                    host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]));
+-                }
+-                if (n_threads > 1 && cur_nj > 1) {
+-                    while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
++                // Split rows across the whole pool, including when only one expert misses the GPU cache.
++                for (cur_phase = 0; cur_phase < 2; ++cur_phase) {
++                    work_done.store(0, std::memory_order_relaxed);
++                    if (n_threads > 1) work_gen.fetch_add(1, std::memory_order_release);
++                    for (int j = 0; j < cur_nj; ++j) {
++                        const int key = cur_layer * n_experts + cur_eid[j];
++                        host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]),
++                                                    cur_act[j], cur_phase, 0, n_threads);
++                    }
++                    if (n_threads > 1) {
++                        while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
++                    }
+                 }
+                 std::atomic_thread_fence(std::memory_order_seq_cst);
+                 h_bell->ack = seq;

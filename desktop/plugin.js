@@ -235,7 +235,7 @@ const inklingControls = [
   { flag: '--max-context', label: 'Context tokens', min: 256, max: 1048576, step: 1 },
   { flag: '--vram-reserve-mib', label: 'Expert placement VRAM reserve (MiB)', min: 0, step: 1 },
   { flag: '--vram-experts-gb', label: 'GPU expert weight cap (GiB)', min: 0, step: 'any' },
-  { flag: '--cpu-threads', label: 'CPU offload threads per NUMA node', min: 0, max: 1024, step: 1 },
+  { flag: '--cpu-threads', label: 'CPU offload worker threads', min: 0, max: 1024, step: 1 },
   { flag: '--parallel', label: 'Concurrent request slots', min: 1, max: 64, step: 1 },
   { flag: '--chunk', label: 'Prompt processing chunk', min: 1, max: 8192, step: 1 },
   { flag: '--gpu', label: 'Primary GPU index', min: 0, step: 1 },
@@ -516,7 +516,7 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
           inkling && jsx('p', { className: 'text-(--ui-text-secondary)',
             children: 'The expert placement reserve is measured before later buffers and context allocations. The free-memory floors stop this Inkling profile if available memory falls below them. Host RAM for offloaded experts and context is managed by the native engine. CPU offload and compressed KV modes can use a different engine path and change speed.' }),
           inkling && jsx('p', { className: 'text-(--ui-text-secondary)',
-            children: 'Strata 0.1.65 offload workaround: use prompt chunk 16 and no more than 16 request slots when setting an expert cap, reserve, CPU offload, multiple GPUs, or K8V8/K8V4. A blank chunk selects 16 for this path.' }),
+            children: 'NVIDIA profiles above 256K use the plugin’s isolated Inkling CUDA fix, with the full context budget accounted for before placing experts. Its first preparation needs the existing CUDA and C++ build tools. DSpark uses additional memory proportional to context. The original engine’s alternate path, including multiple GPUs and K8V8/K8V4, still needs prompt chunk 16 and at most 16 slots.' }),
           jsxs('details', {
             children: [
               jsx('summary', { className: 'cursor-pointer', children: 'Advanced profile settings' }),
@@ -594,6 +594,7 @@ function DownloadProgress({ transfer, active, busy, pausing, onPause, onResume }
 }
 
 function startupLabel(row) {
+  if (row?.stage === 'building-inkling') return 'Building Inkling engine fix'
   if (row?.stage === 'preparing-vision') return 'Preparing vision reader'
   if (row?.stage === 'downloading-mtp') return ['Downloading MTP', row.detail].filter(Boolean).join(' · ')
   if (row?.stage === 'packing-mtp') return 'Packing MTP'
@@ -619,6 +620,9 @@ function ServingStats({ stats }) {
           Number.isFinite(stats.max_context) && ['Loaded context', stats.max_context.toLocaleString()],
           stats.kv_format && ['KV cache', stats.kv_format],
           stats.backend && ['Engine backend', stats.backend],
+          stats.engine_version && ['Engine version', stats.engine_version],
+          Number.isFinite(stats.gpu_experts) && ['Experts in VRAM / RAM', `${stats.gpu_experts} / ${stats.ram_experts ?? '—'}`],
+          Number.isFinite(stats.prompt_read) && Number.isFinite(stats.prompt_total) && ['Reading prompt', `${stats.prompt_read.toLocaleString()} / ${stats.prompt_total.toLocaleString()} tokens`],
           typeof stats.images === 'boolean' && ['Image input', stats.images ? 'Enabled' : 'Off'],
           Number.isFinite(stats.expert_cache_mib) && ['GPU expert cache', `${(stats.expert_cache_mib / 1024).toFixed(1)} GiB`],
           live && ['Live generation', rate(stats.generation_tps)],

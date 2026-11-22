@@ -16,6 +16,47 @@ from dashboard import serving
 
 
 class ServingTests(unittest.TestCase):
+    def test_live_unloaded_server_is_forwardable_for_native_restart(self):
+        record = {"port": 12345, "model": "inkling", "key": "test"}
+        health = {"service": "strata", "model": "inkling", "loaded": False}
+        with patch.object(serving, "urlopen", side_effect=lambda *a, **kw: io.BytesIO(json.dumps(health).encode())):
+            self.assertFalse(serving.online(record, "/health"))
+            self.assertTrue(serving.online(record, "/health", allow_unloaded=True))
+            self.assertFalse(serving.online({**record, "model": "another-model"}, "/health", allow_unloaded=True))
+
+    def test_broken_stream_emits_error_and_does_not_retain_failed_model(self):
+        class BrokenStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+                raise httpx.ReadError("engine stopped")
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            directory = serving.service_root(root)
+            key, alias = "a" * 32, "inkling"
+            serving.write_json(root.parent / "profile-access.json", {"profiles": ["bot"]})
+            serving.write_json(directory / "provider.json", {"port": 12345, "key": "test"})
+            serving.write_json(directory / "models.json", {alias: {"profile_id": key}})
+            serving.write_json(serving.instance_file(directory, key),
+                               {"model": alias, "pid": 101, "port": 12346, "key": "engine", "stop_reason": "Stopped to preserve VRAM."})
+            with (
+                patch("uvicorn.Server") as server,
+                patch.object(serving, "Thread"),
+                patch.object(serving, "launch_shared_profile", return_value=True),
+                patch.object(serving, "process_for", return_value=object()),
+                patch.object(serving, "online", return_value=True),
+                patch.object(serving, "retain_shared_model") as retain,
+                patch.object(httpx.AsyncClient, "send", return_value=httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=BrokenStream())),
+            ):
+                serving.serve_bridge(directory)
+                response = TestClient(server.call_args.args[0].app).post('/v1/chat/completions',
+                    json={"model": alias, "stream": True}, headers={"Authorization": "Bearer test"})
+                self.assertIn('strata_engine_stopped', response.text)
+                self.assertIn('Stopped to preserve VRAM.', response.text)
+                self.assertTrue(response.text.endswith('data: [DONE]\n\n'))
+                retain.assert_not_called()
+                self.assertFalse((directory / "active-request.json").exists())
+
     def test_native_engine_model_info_does_not_hide_verified_alias_stats(self):
         metrics = {"engine": {"model": "Inkling-2-Mini", "images": True},
                    "hardware": {}, "live": {}, "requests": []}

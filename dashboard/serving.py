@@ -21,7 +21,7 @@ PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
 ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe", "strata-inkling", "strata-inkling.exe"}
 PROVIDER_PROTOCOL = 6
-PROVIDER_REVISION = 9
+PROVIDER_REVISION = 10
 DESKTOP_LEASE_SECONDS = 65
 paths = runpy.run_path(str(Path(__file__).with_name("runtime_paths.py")))
 terminal_directory, engine_sources = paths["terminal_directory"], paths["engine_sources"]
@@ -219,14 +219,14 @@ def process_record(process):
     return {"pid": process.pid, "started": psutil.Process(process.pid).create_time()}
 
 
-def online(record, path, timeout=0.6):
+def online(record, path, timeout=0.6, *, allow_unloaded=False):
     try:
         request = Request(f"http://127.0.0.1:{int(record['port'])}{path}",
                           headers={"Authorization": f"Bearer {record['key']}"})
         with urlopen(request, timeout=timeout) as result:
             if path == "/health":
                 health = json.load(result)
-                return health.get("service") == "strata" and health.get("model") == record.get("model") and bool(health.get("loaded"))
+                return health.get("service") == "strata" and health.get("model") == record.get("model") and (allow_unloaded or bool(health.get("loaded")))
             return result.status == 200
     except (OSError, KeyError, TypeError, ValueError):
         return False
@@ -241,6 +241,11 @@ def performance_stats(record):
         if metrics["engine"]["model"] != record["model"] and not online(record, "/health"):
             return None
         hardware, live = metrics["hardware"], metrics["live"]
+        reading = [slot for slot in live.get("slots", []) if slot.get("state") == "reading"]
+        prompt_read, prompt_total = live.get("prompt_read"), live.get("prompt_total")
+        if prompt_total is None and reading:
+            prompt_read = sum(slot.get("prompt_read") or 0 for slot in reading)
+            prompt_total = sum(slot.get("prompt_tokens") or 0 for slot in reading)
         recent = []
         for sample in metrics["requests"][:3]:
             prompt_tokens, prompt_ms = sample.get("prompt_read"), sample.get("prompt_ms")
@@ -261,6 +266,10 @@ def performance_stats(record):
             "max_context": metrics["engine"].get("max_context"),
             "kv_format": metrics["engine"].get("kv_dtype") or metrics["engine"].get("kv"),
             "backend": metrics["engine"].get("backend"),
+            "gpu_experts": metrics["engine"].get("vram_experts"),
+            "ram_experts": metrics["engine"].get("ram_experts"),
+            "engine_version": metrics["engine"].get("version"),
+            "prompt_read": prompt_read, "prompt_total": prompt_total,
             "recent": recent,
         }
     except (OSError, KeyError, TypeError, ValueError, AttributeError):
@@ -551,6 +560,15 @@ def prepare_inkling_config(root, profile, model, destination, strata):
 
     found = shape_engine.find("inkling2", full=False)
     write_json(root / "inkling-engine.json", {"exe": str(found.exe), "version": found.version})
+    if int(controls.get("--max-context") or 32768) > 262144 and getattr(strata, "gpus", lambda: [])():
+        build = runpy.run_path(str(Path(__file__).with_name("inkling_build.py")))
+        config["exe"] = str(build["prepare_engine"](root, strata))
+        config["lib_dirs"] = list(dict.fromkeys([str(Path(found.exe).parent), *config.get("lib_dirs", [])]))
+        floor = int((profile.get("headroom") or {}).get("vram_mib", 0))
+        # WDDM's CUDA free-memory view can run above nvidia-smi's global availability.
+        workspace_floor = floor + 1024 if floor and os.name == "nt" else floor
+        config["env"] = {**(config.get("env") or {}), "HERMES_INKLING_VRAM_FLOOR_MIB": str(workspace_floor)}
+        config["hermes_inkling_cuda"] = True
     write_json(destination, config)
 
 
@@ -603,16 +621,16 @@ def prepare_config(root, profile, model, destination):
     write_json(destination, config)
 
 
-def inkling_engine_args(profile):
+def inkling_engine_args(profile, *, optimized=False):
     args = list(profile.get("user_args", []))
     options = {}
     for index, arg in enumerate(args):
         if arg.startswith("--"):
             flag, separator, value = arg.partition("=")
             options["--kv" if flag == "--kv-dtype" else flag] = value if separator else args[index + 1] if index + 1 < len(args) else ""
-    hybrid = (int(options.get("--vram-reserve-mib", -1)) >= 0 or int(options.get("--cpu-threads", 0)) > 0
-              or int(options.get("--gpus", 1)) > 1 or options.get("--kv") in {"k8v8", "k8v4", "i8", "q8"})
-    if float(options.get("--vram-experts-gb", -1)) >= 0 and not hybrid:
+    hybrid = (int(options.get("--gpus", 1)) > 1 or options.get("--kv") in {"k8v8", "k8v4", "i8", "q8"}
+              or not optimized and (int(options.get("--vram-reserve-mib", -1)) >= 0 or int(options.get("--cpu-threads", 0)) > 0))
+    if not optimized and float(options.get("--vram-experts-gb", -1)) >= 0 and not hybrid:
         # The primary CUDA loader ignores the expert cap; select the native hybrid loader.
         args.extend(("--vram-reserve-mib", "0"))
         hybrid = True
@@ -634,7 +652,6 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
         if intent and previous.get("intent") == intent:
             return
         raise ValueError("This Strata profile is already running.")
-    user_args = inkling_engine_args(profile) if model.get("family") == "inkling-2-mini" else profile.get("user_args", [])
     source = terminal_directory(root)
     config_path = directory / "configs" / f"{key}.json"
     spec_path = directory / "configs" / f"{key}.prepare.json"
@@ -673,6 +690,8 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
         raise ValueError("Strata could not prepare this profile. See the activity log.")
 
     config = read_json(config_path)
+    optimized = config.pop("hermes_inkling_cuda", False)
+    user_args = inkling_engine_args(profile, optimized=optimized) if model.get("family") == "inkling-2-mini" else profile.get("user_args", [])
     engine = config["exe"]
     vision = config.get("vision")
     config.update(profile.get("config") or {})
@@ -729,6 +748,8 @@ def preparation_progress(output):
         if line == "Preparing custom Flash-Next pack from the downloaded GGUF shards.":
             return {"stage": "packing-model"}
         if line.lstrip().startswith("> "):
+            if "inkling-cuda" in line and "build.bat" in line:
+                return {"stage": "building-inkling"}
             if "build-plugin-vision-" in line:
                 return {"stage": "preparing-vision"}
             tool = re.search(r"\bmtp_(fetch|pack|rt)\.py\b", line)
@@ -972,7 +993,7 @@ def serve_bridge(directory):
             try:
                 async for chunk in upstream:
                     yield chunk
-                completed = response.status_code < 400
+                completed = response.status_code < 400 and not getattr(response, "strata_state", {}).get("failed")
             finally:
                 await release(keep_loaded=completed)
 
@@ -1005,12 +1026,12 @@ def serve_bridge(directory):
             process = process_for(instance)
             same_instance = instance.get("model") == alias and (not tracked or (
                 matching and (not choice.get("restarted") or instance.get("intent") == choice["intent"])))
-            if process and same_instance and instance.get("port") and await asyncio.to_thread(online, instance, "/health"):
+            if process and same_instance and instance.get("port") and await asyncio.to_thread(online, instance, "/health", allow_unloaded=True):
                 break
             if not matching and monotonic() >= selection_grace:
                 raise HTTPException(409, "Hermes Desktop did not confirm this Strata profile. Select it in the model picker and retry.")
             if matching and same_instance and instance.get("intent") == choice["intent"] and instance.get("pid") and not process:
-                raise HTTPException(503, "Strata could not start this profile. Check the activity log in Strata Backend.")
+                raise HTTPException(503, instance.get("stop_reason") or "Strata could not start this profile. Check the activity log in Strata Backend.")
             if monotonic() >= deadline:
                 raise HTTPException(503, "Strata is still loading this profile. Check the activity log and retry.")
             if await request.is_disconnected():
@@ -1026,16 +1047,29 @@ def serve_bridge(directory):
             await client.aclose()
             raise HTTPException(503, "Strata is still starting or has stopped. Check its instance status.") from None
 
+        state = {"failed": False}
+
         async def response():
             try:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
+            except httpx.HTTPError:
+                state["failed"] = True
+                if not upstream.headers.get("content-type", "").startswith("text/event-stream"):
+                    raise
+                stopped = read_json(instance_file(directory, selected["profile_id"]))
+                message = stopped.get("stop_reason") or "Strata stopped before completing the response. Check its process status in Strata Backend, then retry."
+                error = {"error": {"type": "server_error", "code": "strata_engine_stopped", "message": message}}
+                yield f"data: {json.dumps(error)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
             finally:
                 await upstream.aclose()
                 await client.aclose()
 
-        return StreamingResponse(response(), status_code=upstream.status_code,
-                                 media_type=upstream.headers.get("content-type", "application/json"))
+        result = StreamingResponse(response(), status_code=upstream.status_code,
+                                   media_type=upstream.headers.get("content-type", "application/json"))
+        result.strata_state = state
+        return result
 
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=int(provider["port"]), access_log=False))
 
