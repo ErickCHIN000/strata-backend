@@ -827,6 +827,20 @@ PROFILE_OPTIONS = {
     "--vram-reserve-mib": (int, 0),
 }
 
+INKLING_OPTIONS = {
+    "--max-context": (int, 256, 1048576),
+    "--vram-reserve-mib": (int, 0, None),
+    "--vram-experts-gb": (float, 0, None),
+    "--cpu-threads": (int, 0, 1024),
+    "--parallel": (int, 1, 64),
+    "--chunk": (int, 1, 8192),
+    "--gpu": (int, 0, None),
+    "--gpus": (int, 1, 2),
+    "--ep-split": (float, 0, 1),
+}
+INKLING_CHOICES = {"--kv": {"auto", "fp16", "fp8", "k8v8", "k8v4"},
+                   "--draft": {"auto", "dspark", "off"}}
+
 
 def profile_arguments(value):
     if not isinstance(value, list) or any(not isinstance(arg, str) or "\x00" in arg for arg in value):
@@ -848,17 +862,25 @@ def save_model_profile(payload):
         if selected_model is not None and (not isinstance(selected_model, str) or len(selected_model) > 1200):
             raise ValueError("Invalid model selection.")
         controls = payload.get("controls") or {}
-        if not isinstance(controls, dict) or any(flag not in PROFILE_OPTIONS for flag in controls):
+        inkling = isinstance(selected_model, str) and selected_model.startswith("catalog:inkling-2-mini:")
+        options = INKLING_OPTIONS if inkling else PROFILE_OPTIONS
+        choices = INKLING_CHOICES if inkling else {}
+        if not isinstance(controls, dict) or any(flag not in options and flag not in choices for flag in controls):
             raise ValueError("Invalid resource option.")
         user_args = []
         for flag, value in controls.items():
-            kind, minimum = PROFILE_OPTIONS[flag]
             if value in (None, ""):
                 continue
+            if flag in choices:
+                if not isinstance(value, str) or value not in choices[flag]:
+                    raise ValueError(f"Invalid value for {flag}.")
+                user_args.extend((flag, value))
+                continue
+            kind, minimum, *maximum = options[flag]
             if isinstance(value, bool) or not isinstance(value, (str, int, float)):
                 raise ValueError(f"Invalid value for {flag}.")
             parsed = kind(value) if not isinstance(value, float) or kind is float else math.nan
-            if not math.isfinite(parsed) or parsed < minimum:
+            if not math.isfinite(parsed) or parsed < minimum or (maximum and maximum[0] is not None and parsed > maximum[0]):
                 raise ValueError(f"Invalid value for {flag}.")
             user_args.extend((flag, str(parsed)))
         arguments = {key: profile_arguments(payload.get(key, []))
@@ -875,6 +897,13 @@ def save_model_profile(payload):
         profile = {"id": profile_id, "name": name.strip(), "model_id": selected_model, "controls": controls,
                    **arguments, "user_args": user_args + arguments["engine_args"], "env": env, "config": config,
                    "vision_mode": vision_mode}
+        if inkling:
+            headroom = payload.get("headroom") or {}
+            if (not isinstance(headroom, dict) or any(key not in {"ram_gib", "vram_mib"} for key in headroom)
+                    or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                           or not math.isfinite(value) or value < 0 for value in headroom.values())):
+                raise ValueError("Memory headroom must contain non-negative RAM GiB and VRAM MiB values.")
+            profile["headroom"] = headroom
         content = json.dumps(profile, indent=2, allow_nan=False)
         if len(content) > 256_000:
             raise ValueError("This model profile is too large.")

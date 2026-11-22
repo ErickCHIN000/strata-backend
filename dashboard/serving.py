@@ -21,7 +21,7 @@ PROVIDER = "strata-backend"
 PROVIDER_NAME = "Strata Backend"
 ENGINE_NAMES = {"strata", "strata.exe", "strata-dsv41", "strata-dsv41.exe", "strata-inkling", "strata-inkling.exe"}
 PROVIDER_PROTOCOL = 6
-PROVIDER_REVISION = 8
+PROVIDER_REVISION = 9
 DESKTOP_LEASE_SECONDS = 65
 paths = runpy.run_path(str(Path(__file__).with_name("runtime_paths.py")))
 terminal_directory, engine_sources = paths["terminal_directory"], paths["engine_sources"]
@@ -258,6 +258,9 @@ def performance_stats(record):
             "vram_used": hardware.get("gpu_mem_used"), "vram_total": hardware.get("gpu_mem_total"),
             "expert_cache_mib": metrics["engine"].get("expert_cache_mib"),
             "images": metrics["engine"].get("images"),
+            "max_context": metrics["engine"].get("max_context"),
+            "kv_format": metrics["engine"].get("kv_dtype") or metrics["engine"].get("kv"),
+            "backend": metrics["engine"].get("backend"),
             "recent": recent,
         }
     except (OSError, KeyError, TypeError, ValueError, AttributeError):
@@ -516,8 +519,9 @@ def prepare_inkling_config(root, profile, model, destination, strata):
     if weight is None:
         raise ValueError("Download the selected Inkling .strata pack before loading it.")
     controls = profile.get("controls") or {}
-    if any(value not in (None, "") for flag, value in controls.items() if flag != "--max-context"):
-        raise ValueError("Inkling uses native RAM/VRAM placement. Clear the Qwen resource controls for this profile.")
+    if any(value not in (None, "") for flag, value in controls.items()
+           if flag in {"--memory-limit-mib", "--resident-budget-gib"}):
+        raise ValueError("Inkling uses native RAM placement. Clear the Qwen RAM controls for this profile.")
     extra = [*profile.get("setup_args", []), *profile.get("launch_args", [])]
     reject_routing_args(extra, {"--family", "--model", "--gguf-dir", "--data-dir", "--models-dir", "--feed",
                                 "--host", "--port", "--api-key", "--build", "--update"})
@@ -532,6 +536,17 @@ def prepare_inkling_config(root, profile, model, destination, strata):
     config = read_json(strata.home() / f"strata-{inkling_family.model_key(model['model'])}.json")
     if not config.get("exe") or not config.get("args"):
         raise ValueError("Inkling setup did not write a usable server config.")
+    # Native setup shares a family config: do not inherit the previous preset's tuning.
+    tuning = {"--kv", "--kv-dtype", "--draft", "--parallel", "--batch", "--slots", "--chunk", "--cpu-threads",
+              "--vram-experts-gb", "--ram-experts-gb", "--vram-reserve-mib", "--gpu", "--gpus", "--ep-split"}
+    from strata_control import user_args
+
+    config["args"] = user_args.flat([group for group in user_args.groups(config["args"])
+                                    if group[0].split("=", 1)[0] not in tuning])
+    config["args_written"] = list(config["args"])
+    config["user_args"] = []
+    config["parallel"] = 1
+    config.pop("gpu", None)
     from strata_control import shape_engine
 
     found = shape_engine.find("inkling2", full=False)
@@ -588,6 +603,28 @@ def prepare_config(root, profile, model, destination):
     write_json(destination, config)
 
 
+def inkling_engine_args(profile):
+    args = list(profile.get("user_args", []))
+    options = {}
+    for index, arg in enumerate(args):
+        if arg.startswith("--"):
+            flag, separator, value = arg.partition("=")
+            options["--kv" if flag == "--kv-dtype" else flag] = value if separator else args[index + 1] if index + 1 < len(args) else ""
+    hybrid = (int(options.get("--vram-reserve-mib", -1)) >= 0 or int(options.get("--cpu-threads", 0)) > 0
+              or int(options.get("--gpus", 1)) > 1 or options.get("--kv") in {"k8v8", "k8v4", "i8", "q8"})
+    if float(options.get("--vram-experts-gb", -1)) >= 0 and not hybrid:
+        # The primary CUDA loader ignores the expert cap; select the native hybrid loader.
+        args.extend(("--vram-reserve-mib", "0"))
+        hybrid = True
+    if hybrid:
+        # 0.1.65 hybrid scratch buffers are sized for 64 hidden rows, not 64 wide projection rows.
+        if int(options.get("--chunk", 16)) > 16 or int(options.get("--parallel", 1)) > 16:
+            raise ValueError("Strata 0.1.65's Inkling offload path needs a prompt chunk and request slots of 16 or less. Use chunk 16 to avoid its native buffer error.")
+        if "--chunk" not in options:
+            args.extend(("--chunk", "16"))
+    return args
+
+
 def start_profile(root, python, env, profile, model, alias, log, intent=None):
     directory = service_root(root)
     key = profile_id(profile["id"])
@@ -597,6 +634,7 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
         if intent and previous.get("intent") == intent:
             return
         raise ValueError("This Strata profile is already running.")
+    user_args = inkling_engine_args(profile) if model.get("family") == "inkling-2-mini" else profile.get("user_args", [])
     source = terminal_directory(root)
     config_path = directory / "configs" / f"{key}.json"
     spec_path = directory / "configs" / f"{key}.prepare.json"
@@ -611,6 +649,11 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
         return
     record = {"profile_id": key, "name": profile["name"], "model": alias, "phase": "preparing",
               "intent": intent}
+    if model.get("family") == "inkling-2-mini" and profile.get("headroom"):
+        record["headroom"] = profile["headroom"]
+        floor = profile["headroom"].get("ram_gib", 0)
+        if psutil.virtual_memory().available < floor * 2**30:
+            raise ValueError(f"This Inkling profile needs at least {floor:g} GiB of free system RAM before loading.")
     prepare = spawn([str(python), "-B", __file__, "prepare", str(root), str(spec_path), str(config_path)], source, env, log)
     write_json(record_path, {**record, **process_record(prepare)})
     result = None
@@ -640,7 +683,7 @@ def start_profile(root, python, env, profile, model, alias, log, intent=None):
             config.pop("vision", None)
     port, secret = loopback_port(), secrets.token_urlsafe(24)
     config.update(exe=engine, host="127.0.0.1", port=port, api_key=secret, model_name=alias, open_browser=False,
-                  user_args=profile.get("user_args", []), env={**(config.get("env") or {}), **profile.get("env", {})})
+                  user_args=user_args, env={**(config.get("env") or {}), **profile.get("env", {})})
     write_json(config_path, config)
     args = profile.get("server_args", [])
     reject_routing_args(args, {"--config", "--host", "--port", "--api-key", "--engine"})
@@ -734,6 +777,10 @@ def instance_rows(root, *, include_stats=False):
                 pass
         row = {"pid": config.get("pid"), "started": config.get("started"), "name": config.get("name"),
                "profile_id": config.get("profile_id"), "managed": True, "state": state, "port": config.get("port")}
+        if config.get("headroom"):
+            row["headroom"] = config["headroom"]
+        if config.get("stop_reason"):
+            row["stop_reason"] = config["stop_reason"]
         logfile = file.with_suffix(".log")
         if state == "ready" and include_stats:
             row["stats"] = performance_stats(config)
@@ -749,6 +796,27 @@ def instance_rows(root, *, include_stats=False):
             rows.append({"pid": process.pid, "started": info["create_time"], "name": info.get("name"),
                          "path": info.get("exe"), "managed": False, "state": "running"})
     return rows
+
+
+def protect_inkling_headroom(root):
+    directory = service_root(root)
+    for file in (directory / "instances").glob("*.json"):
+        record = read_json(file)
+        limits = record.get("headroom")
+        if not limits or not process_for(record) or not online(record, "/health"):
+            continue
+        reason = None
+        ram_free = psutil.virtual_memory().available / 2**30
+        if ram_free < limits.get("ram_gib", 0):
+            reason = f"System RAM headroom fell below {limits['ram_gib']:g} GiB ({ram_free:.1f} GiB available)."
+        stats = performance_stats(record) if limits.get("vram_mib") else None
+        if stats and stats.get("vram_total") is not None and stats.get("vram_used") is not None:
+            vram_free = (stats["vram_total"] - stats["vram_used"]) / 2**20
+            if vram_free < limits["vram_mib"]:
+                reason = f"GPU headroom fell below {limits['vram_mib']:g} MiB ({vram_free:.0f} MiB available)."
+        if reason:
+            stop_instance(root, record)
+            write_json(file, {**read_json(file), "stop_reason": f"Stopped to preserve memory: {reason}"})
 
 
 def stop_instance(root, payload):
@@ -980,6 +1048,7 @@ def serve_bridge(directory):
                 windows = directory / "windows"
                 if windows.is_dir() or monotonic() - started >= DESKTOP_LEASE_SECONDS:
                     stop_unselected(root, selected)
+                    protect_inkling_headroom(root)
                     shared = bool(read_json(root.parent / "profile-access.json").get("profiles"))
                     if (closed or not windows.is_dir()) and not shared and not (selected or {}).get("request"):
                         server.should_exit = True

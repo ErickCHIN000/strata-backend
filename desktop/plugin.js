@@ -231,6 +231,22 @@ const controls = [
   { flag: '--vram-reserve-mib', label: 'VRAM reserve target (MiB)', min: 0, step: 1 },
 ]
 
+const inklingControls = [
+  { flag: '--max-context', label: 'Context tokens', min: 256, max: 1048576, step: 1 },
+  { flag: '--vram-reserve-mib', label: 'Expert placement VRAM reserve (MiB)', min: 0, step: 1 },
+  { flag: '--vram-experts-gb', label: 'GPU expert weight cap (GiB)', min: 0, step: 'any' },
+  { flag: '--cpu-threads', label: 'CPU offload threads per NUMA node', min: 0, max: 1024, step: 1 },
+  { flag: '--parallel', label: 'Concurrent request slots', min: 1, max: 64, step: 1 },
+  { flag: '--chunk', label: 'Prompt processing chunk', min: 1, max: 8192, step: 1 },
+  { flag: '--gpu', label: 'Primary GPU index', min: 0, step: 1 },
+  { flag: '--gpus', label: 'GPU count', min: 1, max: 2, step: 1 },
+  { flag: '--ep-split', label: 'Second GPU expert fraction', min: 0, max: 1, step: 'any' },
+]
+const inklingChoices = {
+  '--kv': { label: 'KV cache format', options: [['auto', 'Automatic'], ['fp16', 'FP16'], ['fp8', 'FP8'], ['k8v8', 'K8V8'], ['k8v4', 'K8V4']] },
+  '--draft': { label: 'DSpark drafting', options: [['auto', 'Automatic'], ['dspark', 'On'], ['off', 'Off']] },
+}
+
 const advancedFields = {
   engine_args: 'Engine arguments (JSON array)', launch_args: 'Launch arguments (JSON array)',
   setup_args: 'Setup arguments (JSON array)', server_args: 'Server arguments (JSON array)',
@@ -241,6 +257,7 @@ function profileDraft(profile = {}) {
   return {
     id: profile.id, name: profile.name ?? '', model_id: profile.model_id ?? '', controls: profile.controls ?? {},
     vision_mode: profile.vision_mode ?? (profile.config?.vision ? profile.config.vision.gpu ? 'gpu' : 'cpu' : 'off'),
+    headroom: profile.headroom ?? {},
     ...Object.fromEntries(Object.keys(advancedFields).map(name => [
       name, JSON.stringify(profile[name] ?? (name.endsWith('_args') ? [] : {}), null, 2),
     ])),
@@ -406,6 +423,8 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
   const missingModel = draft.model_id && !entries.has(draft.model_id)
   const model = library?.models?.find(item => item.id === draft.model_id)
   const inkling = model?.family === 'inkling-2-mini'
+  const profileControls = inkling ? inklingControls : controls
+  const allowedControls = new Set([...profileControls.map(control => control.flag), ...(inkling ? Object.keys(inklingChoices) : [])])
 
   function edit(name, value) {
     setDraft(previous => ({ ...previous, [name]: value }))
@@ -422,7 +441,8 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
       const result = await ctx.rest('/runtime/save-profile', {
         method: 'POST', body: {
           ...draft, model_id: draft.model_id || null, ...advanced,
-          controls: inkling ? Object.fromEntries(Object.entries(draft.controls).filter(([flag]) => flag === '--max-context')) : draft.controls,
+          controls: Object.fromEntries(Object.entries(draft.controls).filter(([flag]) => allowedControls.has(flag))),
+          headroom: inkling ? Object.fromEntries(Object.entries(draft.headroom).filter(([, value]) => value !== '').map(([key, value]) => [key, Number(value)])) : undefined,
         },
       })
       if (!result.ok) throw new Error(result.error || 'Could not save the profile.')
@@ -473,14 +493,30 @@ function ModelProfiles({ ctx, queryScope, library, revision, busy, onSave }) {
           }),
           jsx('div', {
             className: 'grid gap-2 sm:grid-cols-2',
-            children: controls.filter(control => !inkling || control.flag === '--max-context').map(control => jsxs('label', {
+            children: profileControls.map(control => jsxs('label', {
               children: [control.label, jsx('input', {
-                className: inputClass, type: 'number', min: control.min, step: control.step, placeholder: 'Strata default',
+                className: inputClass, type: 'number', min: control.min, max: control.max, step: control.step, placeholder: 'Strata default',
                 value: draft.controls[control.flag] ?? '', disabled: saving,
                 onChange: event => edit('controls', { ...draft.controls, [control.flag]: event.target.value }),
               })],
             }, control.flag)),
           }),
+          inkling && jsxs('div', { className: 'grid gap-3 sm:grid-cols-2', children: [
+            ...Object.entries(inklingChoices).map(([flag, choice]) => jsx(ThemedSelect, {
+              ...choice, value: draft.controls[flag] || 'auto', disabled: saving,
+              onChange: value => edit('controls', { ...draft.controls, [flag]: value }),
+            }, flag)),
+            ...[['ram_gib', 'Minimum free system RAM (GiB)'], ['vram_mib', 'Minimum free GPU VRAM (MiB)']].map(([key, label]) => jsxs('label', {
+              children: [label, jsx('input', {
+                className: inputClass, type: 'number', min: 0, step: 1, placeholder: 'No automatic stop', disabled: saving,
+                value: draft.headroom[key] ?? '', onChange: event => edit('headroom', { ...draft.headroom, [key]: event.target.value }),
+              })],
+            }, key)),
+          ] }),
+          inkling && jsx('p', { className: 'text-(--ui-text-secondary)',
+            children: 'The expert placement reserve is measured before later buffers and context allocations. The free-memory floors stop this Inkling profile if available memory falls below them. Host RAM for offloaded experts and context is managed by the native engine. CPU offload and compressed KV modes can use a different engine path and change speed.' }),
+          inkling && jsx('p', { className: 'text-(--ui-text-secondary)',
+            children: 'Strata 0.1.65 offload workaround: use prompt chunk 16 and no more than 16 request slots when setting an expert cap, reserve, CPU offload, multiple GPUs, or K8V8/K8V4. A blank chunk selects 16 for this path.' }),
           jsxs('details', {
             children: [
               jsx('summary', { className: 'cursor-pointer', children: 'Advanced profile settings' }),
@@ -580,6 +616,9 @@ function ServingStats({ stats }) {
         children: [
           ['System RAM', memory(stats.ram_used, stats.ram_total)],
           ['GPU VRAM', memory(stats.vram_used, stats.vram_total)],
+          Number.isFinite(stats.max_context) && ['Loaded context', stats.max_context.toLocaleString()],
+          stats.kv_format && ['KV cache', stats.kv_format],
+          stats.backend && ['Engine backend', stats.backend],
           typeof stats.images === 'boolean' && ['Image input', stats.images ? 'Enabled' : 'Off'],
           Number.isFinite(stats.expert_cache_mib) && ['GPU expert cache', `${(stats.expert_cache_mib / 1024).toFixed(1)} GiB`],
           live && ['Live generation', rate(stats.generation_tps)],
@@ -713,6 +752,7 @@ function ServingControls({ ctx, serving }) {
               jsx('div', { children: `${row.name} · ${startupLabel(row)}` }),
               jsx('div', { className: 'text-(--ui-text-secondary)', children: [row.managed ? 'Managed' : 'External', row.pid && `PID ${row.pid}`, row.path].filter(Boolean).join(' · ') }),
               row.stats && jsx(ServingStats, { stats: row.stats }),
+              row.stop_reason && jsx('p', { role: 'status', children: row.stop_reason }),
               row.log && jsxs('details', { children: [jsx('summary', { children: 'Server log' }),
                 jsx('pre', { className: 'max-h-48 overflow-auto whitespace-pre-wrap text-xs', children: row.log })] }),
             ] }),
